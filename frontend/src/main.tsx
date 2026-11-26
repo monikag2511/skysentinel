@@ -9,6 +9,9 @@ import { LiveTrackingPage } from "./pages/LiveTrackingPage";
 import { DeviationsPage } from "./pages/DeviationsPage";
 import { MlAnalysisPage } from "./pages/MlAnalysisPage";
 import { NetworkSecurityPage } from "./pages/NetworkSecurityPage";
+import { SimulationPage } from "./pages/SimulationPage";
+import { RecoveryPage } from "./pages/RecoveryPage";
+import { AlertsPage } from "./pages/AlertsPage";
 import type { DashboardData, Drone, NavSection, Reading, Snapshot } from "./types";
 import "./style.css";
 
@@ -71,6 +74,8 @@ function App() {
   const [live, play] = useState(false);
   const [filter, setFilter] = useState("All aircraft");
   const [notice, tell] = useState("");
+  const [soundEnabled, setSoundEnabled] = useState(true);
+  const lastCriticalId = useRef<number>(0);
   const [evaluation, report] = useState<{
     train: number;
     test: number;
@@ -90,7 +95,32 @@ function App() {
     ]);
     if (ticket === version.current) {
       setSnapshot(watchData);
-      if (dashData) setDashboard(dashData);
+      if (dashData) {
+        setDashboard(dashData);
+        const newestCrit = dashData.recent_attacks.find(
+          (a: { severity: string; status: string; id: number }) =>
+            a.severity === "Critical" && a.status === "Active",
+        );
+        if (newestCrit && newestCrit.id > lastCriticalId.current) {
+          if (lastCriticalId.current !== 0 && soundEnabled) {
+            try {
+              const ctx = new AudioContext();
+              const osc = ctx.createOscillator();
+              const gain = ctx.createGain();
+              osc.type = "triangle";
+              osc.frequency.setValueAtTime(880, ctx.currentTime);
+              gain.gain.setValueAtTime(0.08, ctx.currentTime);
+              osc.connect(gain);
+              gain.connect(ctx.destination);
+              osc.start();
+              osc.stop(ctx.currentTime + 0.25);
+            } catch {
+              // AudioContext may require prior user gesture
+            }
+          }
+          lastCriticalId.current = newestCrit.id;
+        }
+      }
       fail("");
     }
   }
@@ -285,6 +315,29 @@ function App() {
             ) : section === "network" ? (
               <NetworkSecurityPage
                 role={snapshot.role}
+                requestApi={request}
+                onChanged={refresh}
+              />
+            ) : section === "simulation" ? (
+              <SimulationPage
+                fleet={snapshot.fleet}
+                role={snapshot.role}
+                requestApi={request}
+                onChanged={refresh}
+                onNavigateRecovery={() => setSection("recovery")}
+              />
+            ) : section === "recovery" ? (
+              <RecoveryPage
+                fleet={snapshot.fleet}
+                role={snapshot.role}
+                requestApi={request}
+                onChanged={refresh}
+              />
+            ) : section === "alerts" ? (
+              <AlertsPage
+                role={snapshot.role}
+                soundEnabled={soundEnabled}
+                onToggleSound={() => setSoundEnabled(!soundEnabled)}
                 requestApi={request}
                 onChanged={refresh}
               />

@@ -96,3 +96,36 @@ def test_network_monitoring_and_device_blocking(tmp_path):
             json={"device_uid": "RELAY-01", "name": "Ground Relay", "ip_address": "10.42.1.88"},
         )
         assert added.status_code == 201
+
+
+def test_simulations_recovery_and_alerts(tmp_path):
+    engine = create_engine(f"sqlite:///{tmp_path / 'sim.db'}")
+    metadata.create_all(engine)
+    with TestClient(create_app(engine)) as client:
+        for atk in (
+            "gps_spoofing",
+            "unauthorized_device",
+            "packet_injection",
+            "replay_attack",
+            "suspicious_traffic",
+            "abnormal_location",
+            "comm_interruption",
+        ):
+            res = client.post("/api/simulations/run", json={"drone_id": 0, "attack_type": atk})
+            assert res.is_success, f"{atk}: {res.text}"
+            assert res.json()["simulated"] is True
+            assert len(res.json()["steps"]) >= 3
+
+        alerts = client.get("/api/alerts").json()["items"]
+        assert len(alerts) >= 7
+        first_id = alerts[0]["id"]
+        assert client.post(f"/api/alerts/{first_id}/acknowledge").is_success
+        assert client.post(f"/api/alerts/{first_id}/resolve").is_success
+
+        recs = client.get("/api/recoveries").json()["items"]
+        assert len(recs) >= 1
+
+        for act in ("Attitude Hold", "Manual Override", "Emergency Motor Disarm", "Return to Home", "Resume Patrol"):
+            r = client.post("/api/drones/0/recover", json={"action": act})
+            assert r.is_success, f"{act}: {r.text}"
+            assert r.json()["status"] == "Successful"

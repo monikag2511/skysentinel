@@ -1,4 +1,5 @@
-from typing import Optional
+from time import monotonic
+from typing import Literal, Optional
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select
@@ -12,8 +13,8 @@ from db import (
     samples,
     trusted_devices,
 )
-from model import position, trained
-from service import get_thresholds, log, now, record_audit
+from model import position, reading, trained
+from service import create_alert, get_thresholds, log, now, record_audit
 
 
 class DroneCreate(BaseModel):
@@ -34,6 +35,25 @@ class TrustedDeviceCreate(BaseModel):
     ip_address: str = Field(..., min_length=4, max_length=45)
     mac_address: str = Field("02:53:4B:00:99:01", min_length=6, max_length=32)
     drone_id: Optional[int] = None
+
+
+class SimulationRequest(BaseModel):
+    drone_id: int
+    attack_type: Literal[
+        "gps_spoofing",
+        "unauthorized_device",
+        "packet_injection",
+        "replay_attack",
+        "suspicious_traffic",
+        "abnormal_location",
+        "comm_interruption",
+    ]
+
+
+class RecoveryActionRequest(BaseModel):
+    action: Literal["Return to Home", "Attitude Hold", "Manual Override", "Emergency Motor Disarm", "Resume Patrol"]
+    recovery_id: Optional[int] = None
+    reason: Optional[str] = None
 
 
 class DroneUpdate(BaseModel):
@@ -541,6 +561,364 @@ def build_platform_router(engine, lock, watch):
             )
             record_audit(c, "operator", "TRUST_DEVICE", uid, f"Restored trust for {uid}")
             return {"ok": True, "device_uid": uid, "status": "Trusted"}
+
+    @router.post("/simulations/run")
+    def run_simulation(payload: SimulationRequest):
+        with lock, engine.begin() as c:
+            d = c.execute(select(drones).where(drones.c.id == payload.drone_id).with_for_update()).mappings().first()
+            if not d:
+                raise HTTPException(404, "Drone not found")
+            steps = []
+            atk = payload.attack_type
+            watch.ensure_key(d.id)
+
+            if atk == "gps_spoofing":
+                if d.mode != "Patrol":
+                    c.execute(drones.update().where(drones.c.id == d.id).values(mode="Patrol", streak=0))
+                for _ in range(2):
+                    watch.advance(c, d.id, "gps", simulated=True)
+                steps = [
+                    "1. Generated 2 simulated spoofed GPS frames with velocity/signal anomalies.",
+                    "2. Random Forest + IMU corridor analyzer flagged GPS Spoofing.",
+                    "3. Drone status transitioned to Attitude hold / GPS Spoofed.",
+                    "4. Critical/High security alert generated & flight deviation logged.",
+                    "5. Autonomous Recovery recommended Return to Home.",
+                ]
+            elif atk == "abnormal_location":
+                if d.mode != "Patrol":
+                    c.execute(drones.update().where(drones.c.id == d.id).values(mode="Patrol", streak=0))
+                import random
+                seq = d.seq + 1
+                exp = position(d.id, seq, base_lat=d.base_lat, base_lon=d.base_lon, route_config=d.route_config)
+                row = reading(d.id, seq, True, random.Random(9000 + seq), base_lat=d.base_lat, base_lon=d.base_lon, route_config=d.route_config)
+                row["latitude"] = round(exp[0] + 0.0045, 6)
+                row["longitude"] = round(exp[1] + 0.0045, 6)
+                nonce, data = watch.seal(d.id, seq, row)
+                watch.receive(c, d, d.id, seq, (nonce, data), simulated=True)
+                # Second frame to trigger hold & recovery
+                d2 = c.execute(select(drones).where(drones.c.id == d.id)).mappings().one()
+                seq2 = d2.seq + 1
+                row2 = dict(row)
+                row2["latitude"] = round(exp[0] + 0.0048, 6)
+                nonce2, data2 = watch.seal(d.id, seq2, row2)
+                watch.receive(c, d2, d.id, seq2, (nonce2, data2), simulated=True)
+                steps = [
+                    "1. Injected sudden 500m+ coordinate jump outside planned corridor.",
+                    "2. Path deviation detector measured jump > threshold and flagged anomaly.",
+                    "3. Map warning markers & affected red segment highlighted.",
+                    "4. Security alert and deviation history recorded.",
+                    "5. Autonomous Recovery queued Return to Home.",
+                ]
+            elif atk == "unauthorized_device":
+                watch.advance(c, d.id, "unknown", simulated=True)
+                steps = [
+                    "1. Simulated telemetry frame from unregistered node UNKNOWN-NODE-FF.",
+                    "2. Sender authentication rejected frame before updating flight state.",
+                    "3. Packet logged in Network Monitor as Unauthorized Access.",
+                    "4. High-severity alert & security log recorded.",
+                ]
+            elif atk == "packet_injection":
+                watch.advance(c, d.id, "integrity", simulated=True)
+                steps = [
+                    "1. Injected modified ciphertext violating AES-256-GCM authentication tag.",
+                    "2. Cryptographic verifier dropped tampered payload (Integrity Failed).",
+                    "3. Packet Injection indicator logged in Network Traffic Monitor.",
+                    "4. High-severity security alert raised.",
+                ]
+            elif atk == "replay_attack":
+                watch.advance(c, d.id, "duplicate", simulated=True)
+                steps = [
+                    "1. Replayed previously accepted telemetry sequence number.",
+                    "2. Anti-replay sequence check rejected stale frame.",
+                    "3. Replay Attack indicator stored in Network Monitor & Security Logs.",
+                    "4. Medium-severity alert raised.",
+                ]
+            elif atk == "suspicious_traffic":
+                burst_t = monotonic()
+                for _ in range(9):
+                    reason = watch.advance(c, d.id, "normal", arrived=burst_t, simulated=True)
+                    if reason:
+                        break
+                c.execute(
+                    network_packets.insert().values(
+                        drone_id=d.id,
+                        time=now(),
+                        direction="Inbound",
+                        src_addr="198.51.100.77",
+                        dst_addr="10.42.0.1:8443",
+                        device_uid="MITM-PROXY-SIM",
+                        packet_size=1420,
+                        protocol="RAW/TCP",
+                        encrypted=False,
+                        auth_status="MITM Suspected",
+                        threat_type="MITM Suspected",
+                        simulated=True,
+                        detail="Simulated ARP/TLS downgrade probe & high-rate packet flood detected.",
+                    )
+                )
+                ev_id = log(c, d.id, "MITM & Traffic Burst", "Simulated suspicious network flood and MITM probe detected.", "Critical", "Open", category="Network", simulated=True)
+                al_id = create_alert(
+                    c,
+                    d.id,
+                    "MITM Suspected",
+                    "Critical",
+                    f"[SIMULATED] Suspicious traffic burst and MITM probe targeting {d.name}.",
+                    confidence=96.0,
+                    simulated=True,
+                    source_event_id=ev_id,
+                )
+                c.execute(
+                    recoveries.insert().values(
+                        drone_id=d.id,
+                        alert_id=al_id,
+                        recommended_action="Attitude Hold",
+                        recommendation_reason="Suspicious network flood / MITM indicator detected on control link.",
+                        selected_action=None,
+                        status="Recommended",
+                        initiated_by="Autonomous Advisor",
+                        simulated=True,
+                        created_at=now(),
+                        completed_at=None,
+                        detail="Hold position while isolating suspicious network node.",
+                    )
+                )
+                steps = [
+                    "1. Simulated 9x packet flood + unencrypted MITM proxy probe.",
+                    "2. Rate limiter and deep packet inspection classified MITM Suspected.",
+                    "3. Critical alert and network threat telemetry recorded.",
+                    "4. Autonomous Recovery recommended Attitude Hold.",
+                ]
+            elif atk == "comm_interruption":
+                c.execute(
+                    drones.update()
+                    .where(drones.c.id == d.id)
+                    .values(comm_status="Disconnected", gps_status="Degraded", mode="Attitude hold")
+                )
+                c.execute(
+                    network_packets.insert().values(
+                        drone_id=d.id,
+                        time=now(),
+                        direction="Inbound",
+                        src_addr=f"10.42.1.{10 + d.id}",
+                        dst_addr="10.42.0.1:8443",
+                        device_uid=f"UAV-LINK-{d.id + 1:03d}",
+                        packet_size=0,
+                        protocol="LINK-TIMEOUT",
+                        encrypted=False,
+                        auth_status="Integrity Failed",
+                        threat_type="Communication Interruption",
+                        simulated=True,
+                        detail="Simulated RF link heartbeat timeout (>5000ms).",
+                    )
+                )
+                ev_id = log(c, d.id, "Communication interruption", "Simulated control-link loss; fail-safe hold engaged.", "Critical", "Open", category="Network", simulated=True)
+                al_id = create_alert(
+                    c,
+                    d.id,
+                    "Communication Interruption",
+                    "Critical",
+                    f"[SIMULATED] Control-link heartbeat lost for {d.name}.",
+                    confidence=99.0,
+                    simulated=True,
+                    source_event_id=ev_id,
+                )
+                c.execute(
+                    recoveries.insert().values(
+                        drone_id=d.id,
+                        alert_id=al_id,
+                        recommended_action="Return to Home",
+                        recommendation_reason="Simulated link interruption triggered autonomous RTH fail-safe.",
+                        selected_action=None,
+                        status="Recommended",
+                        initiated_by="Autonomous Advisor",
+                        simulated=True,
+                        created_at=now(),
+                        completed_at=None,
+                        detail="Awaiting operator recovery decision.",
+                    )
+                )
+                steps = [
+                    "1. Simulated control-link RF timeout for selected aircraft.",
+                    "2. Communication status updated to Disconnected; flight mode set to Attitude hold.",
+                    "3. Critical alert and link-loss incident stored in Security Logs.",
+                    "4. Autonomous Recovery recommended Return to Home.",
+                ]
+
+            record_audit(c, "operator", "SIMULATE_ATTACK", d.code, f"Simulated {atk} on {d.name}")
+            return {"ok": True, "simulated": True, "attack_type": atk, "drone_id": d.id, "steps": steps}
+
+    @router.get("/alerts")
+    def list_alerts(
+        q: str = Query("", max_length=100),
+        severity: Optional[str] = None,
+        attack_type: Optional[str] = None,
+        status: Optional[str] = None,
+    ):
+        with lock, engine.connect() as c:
+            all_drones = {d.id: d for d in c.execute(select(drones)).mappings()}
+            query = select(alerts).order_by(alerts.c.id.desc()).limit(200)
+            if severity:
+                query = query.where(alerts.c.severity == severity)
+            if attack_type:
+                query = query.where(alerts.c.attack_type == attack_type)
+            if status:
+                query = query.where(alerts.c.status == status)
+            rows = c.execute(query).mappings().all()
+            items = []
+            needle = q.strip().lower()
+            for r in rows:
+                d_name = all_drones[r["drone_id"]].name if r["drone_id"] in all_drones else "Fleet"
+                d_code = all_drones[r["drone_id"]].code if r["drone_id"] in all_drones else "SYS"
+                if needle and not (
+                    needle in r["alert_code"].lower()
+                    or needle in r["attack_type"].lower()
+                    or needle in r["description"].lower()
+                    or needle in d_name.lower()
+                ):
+                    continue
+                items.append({**r, "drone_name": d_name, "drone_code": d_code})
+            attack_types = sorted({r["attack_type"] for r in c.execute(select(alerts.c.attack_type)).mappings()})
+            return {"items": items, "attack_types": attack_types}
+
+    @router.post("/alerts/{alert_id}/acknowledge")
+    def ack_alert(alert_id: int):
+        with lock, engine.begin() as c:
+            al = c.execute(select(alerts).where(alerts.c.id == alert_id)).mappings().first()
+            if not al:
+                raise HTTPException(404, "Alert not found")
+            c.execute(alerts.update().where(alerts.c.id == alert_id).values(status="Acknowledged"))
+            if al["source_event_id"]:
+                c.execute(events.update().where(events.c.id == al["source_event_id"]).values(status="Acknowledged"))
+            record_audit(c, "operator", "ACK_ALERT", al["alert_code"], f"Acknowledged {al['attack_type']}")
+            return {"ok": True}
+
+    @router.post("/alerts/{alert_id}/resolve")
+    def resolve_alert(alert_id: int):
+        with lock, engine.begin() as c:
+            al = c.execute(select(alerts).where(alerts.c.id == alert_id)).mappings().first()
+            if not al:
+                raise HTTPException(404, "Alert not found")
+            c.execute(alerts.update().where(alerts.c.id == alert_id).values(status="Resolved"))
+            if al["source_event_id"]:
+                c.execute(events.update().where(events.c.id == al["source_event_id"]).values(status="Resolved"))
+            record_audit(c, "operator", "RESOLVE_ALERT", al["alert_code"], f"Resolved {al['attack_type']}")
+            return {"ok": True}
+
+    @router.get("/recoveries")
+    def list_recoveries():
+        with lock, engine.connect() as c:
+            all_drones = {d.id: d for d in c.execute(select(drones)).mappings()}
+            rows = c.execute(select(recoveries).order_by(recoveries.c.id.desc()).limit(100)).mappings().all()
+            return {
+                "items": [
+                    {
+                        **r,
+                        "drone_name": all_drones[r["drone_id"]].name if r["drone_id"] in all_drones else f"Drone {r['drone_id']}",
+                        "drone_code": all_drones[r["drone_id"]].code if r["drone_id"] in all_drones else "DRN",
+                    }
+                    for r in rows
+                ]
+            }
+
+    @router.post("/drones/{device}/recover")
+    def execute_recovery(device: int, payload: RecoveryActionRequest):
+        with lock, engine.begin() as c:
+            d = c.execute(select(drones).where(drones.c.id == device).with_for_update()).mappings().first()
+            if not d:
+                raise HTTPException(404, "Drone not found")
+            action = payload.action
+            ts = now()
+            home_pos = list(position(device, 0, base_lat=d.base_lat, base_lon=d.base_lon, route_config=d.route_config))
+
+            if action == "Return to Home":
+                new_mode, new_gps, new_comm, new_sensor = "At base", "Connected", "Encrypted", "Nominal"
+                new_trusted = home_pos
+                detail = "Simulated autonomous Return to Home completed; aircraft landed at safe base coordinates."
+            elif action == "Attitude Hold":
+                new_mode, new_gps, new_comm, new_sensor = "Attitude hold", d.gps_status, "Encrypted", d.sensor_status
+                new_trusted = d.trusted
+                detail = "Simulated Attitude Hold engaged using inertial sensors; ignoring untrusted GPS fixes."
+            elif action == "Manual Override":
+                new_mode, new_gps, new_comm, new_sensor = "Manual override", "Degraded", "Encrypted", "Nominal"
+                new_trusted = d.trusted
+                detail = "Operator assumed simulated manual RC/GCS flight control override."
+            elif action == "Emergency Motor Disarm":
+                new_mode, new_gps, new_comm, new_sensor = "Disarmed", d.gps_status, d.comm_status, d.sensor_status
+                new_trusted = d.trusted
+                detail = "Simulated emergency motor disarm executed (hardware safety simulation only)."
+            else:  # Resume Patrol
+                new_mode, new_gps, new_comm, new_sensor = "Patrol", "Connected", "Encrypted", "Nominal"
+                new_trusted = d.trusted
+                detail = "Simulated patrol resumed from safe recovery state."
+
+            c.execute(
+                drones.update()
+                .where(drones.c.id == device)
+                .values(
+                    mode=new_mode,
+                    gps_status=new_gps,
+                    comm_status=new_comm,
+                    sensor_status=new_sensor,
+                    trusted=new_trusted,
+                    streak=0 if action in ("Return to Home", "Resume Patrol") else d.streak,
+                )
+            )
+            if action in ("Return to Home", "Resume Patrol", "Emergency Motor Disarm"):
+                c.execute(
+                    alerts.update()
+                    .where(alerts.c.drone_id == device, alerts.c.status != "Resolved")
+                    .values(status="Resolved")
+                )
+                c.execute(
+                    events.update()
+                    .where(events.c.drone == device, events.c.status == "Open")
+                    .values(status="Resolved")
+                )
+
+            if payload.recovery_id:
+                c.execute(
+                    recoveries.update()
+                    .where(recoveries.c.id == payload.recovery_id)
+                    .values(
+                        selected_action=action,
+                        status="Successful",
+                        initiated_by="Operator",
+                        completed_at=ts,
+                        detail=detail,
+                    )
+                )
+                rec_id = payload.recovery_id
+            else:
+                rec_id = (
+                    c.execute(
+                        recoveries.insert().values(
+                            drone_id=device,
+                            alert_id=None,
+                            recommended_action=action,
+                            recommendation_reason=payload.reason or f"Operator-initiated {action}.",
+                            selected_action=action,
+                            status="Successful",
+                            initiated_by="Operator",
+                            simulated=True,
+                            created_at=ts,
+                            completed_at=ts,
+                            detail=detail,
+                        )
+                    ).inserted_primary_key[0]
+                )
+
+            log(c, device, f"Recovery: {action}", detail, "Info", "Recorded", category="Recovery", simulated=True)
+            create_alert(
+                c,
+                device,
+                "Recovery Initiated",
+                "Low",
+                f"[SIMULATED] {action} initiated for {d.name}: {detail}",
+                confidence=100.0,
+                simulated=True,
+            )
+            record_audit(c, "operator", "RECOVERY_ACTION", d.code, f"Executed simulated {action}")
+            return {"ok": True, "recovery_id": rec_id, "action": action, "status": "Successful", "mode": new_mode}
 
     @router.get("/deviations")
     def list_deviations(drone_id: Optional[int] = None, severity: Optional[str] = None):
