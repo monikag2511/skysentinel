@@ -8,6 +8,7 @@ import { DroneManagementPage } from "./pages/DroneManagementPage";
 import { LiveTrackingPage } from "./pages/LiveTrackingPage";
 import { DeviationsPage } from "./pages/DeviationsPage";
 import { MlAnalysisPage } from "./pages/MlAnalysisPage";
+import { NetworkSecurityPage } from "./pages/NetworkSecurityPage";
 import type { DashboardData, Drone, NavSection, Reading, Snapshot } from "./types";
 import "./style.css";
 
@@ -281,6 +282,12 @@ function App() {
               />
             ) : section === "ml" ? (
               <MlAnalysisPage fleet={snapshot.fleet} requestApi={request} />
+            ) : section === "network" ? (
+              <NetworkSecurityPage
+                role={snapshot.role}
+                requestApi={request}
+                onChanged={refresh}
+              />
             ) : section === "deviations" ? (
               <DeviationsPage
                 fleet={snapshot.fleet}

@@ -6,7 +6,7 @@ from fastapi import FastAPI, HTTPException, Query, Request
 from pydantic import BaseModel
 from sqlalchemy import or_, select
 from sqlalchemy.exc import SQLAlchemyError
-from db import alerts, database, drones, events, recoveries, samples
+from db import alerts, database, drones, events, network_packets, recoveries, samples
 from model import position, trained
 from routes_platform import build_platform_router
 from service import FlightWatch, create_alert, log, now
@@ -196,6 +196,23 @@ def create_app(engine=None, *, docs=True):
                     reason = watch.advance(c, device, "normal" if cmd.action == "rate" else cmd.action, burst_time)
                     if reason:
                         break
+            c.execute(
+                network_packets.insert().values(
+                    drone_id=device,
+                    time=now(),
+                    direction="Outbound",
+                    src_addr="10.42.0.1:8443",
+                    dst_addr=f"10.42.1.{10 + device}:9000",
+                    device_uid="GCS-CTRL-01",
+                    packet_size=96,
+                    protocol="AES-256-GCM/UDP",
+                    encrypted=True,
+                    auth_status="Authenticated",
+                    threat_type=None,
+                    simulated=False,
+                    detail=f"Encrypted control command '{cmd.action}' dispatched to {d.name}.",
+                )
+            )
             return {"ok": True}
 
     app.include_router(build_platform_router(engine, lock, watch))

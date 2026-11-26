@@ -28,6 +28,14 @@ class DroneCreate(BaseModel):
     route_config: Optional[list[list[float]]] = None
 
 
+class TrustedDeviceCreate(BaseModel):
+    device_uid: str = Field(..., min_length=3, max_length=48)
+    name: str = Field(..., min_length=2, max_length=64)
+    ip_address: str = Field(..., min_length=4, max_length=45)
+    mac_address: str = Field("02:53:4B:00:99:01", min_length=6, max_length=32)
+    drone_id: Optional[int] = None
+
+
 class DroneUpdate(BaseModel):
     name: Optional[str] = Field(None, min_length=2, max_length=64)
     model_type: Optional[str] = Field(None, min_length=2, max_length=64)
@@ -404,6 +412,135 @@ def build_platform_router(engine, lock, watch):
                     for r in filtered[:80]
                 ],
             }
+
+    @router.get("/network/overview")
+    def network_overview(direction: Optional[str] = None, threat_only: bool = False):
+        with lock, engine.connect() as c:
+            all_drones = {d.id: d for d in c.execute(select(drones)).mappings()}
+            pkt_q = select(network_packets).order_by(network_packets.c.id.desc()).limit(120)
+            if direction in ("Inbound", "Outbound"):
+                pkt_q = pkt_q.where(network_packets.c.direction == direction)
+            if threat_only:
+                pkt_q = pkt_q.where(network_packets.c.threat_type.is_not(None))
+            packets = c.execute(pkt_q).mappings().all()
+            devices = c.execute(select(trusted_devices).order_by(trusted_devices.c.id)).mappings().all()
+            all_pkts = c.execute(select(network_packets)).mappings().all()
+            encrypted_count = sum(1 for p in all_pkts if p["encrypted"])
+            auth_ok_count = sum(1 for p in all_pkts if p["auth_status"] == "Authenticated")
+            threat_counts = {
+                "packet_injection": sum(1 for p in all_pkts if p["threat_type"] == "Packet Injection"),
+                "replay_attack": sum(1 for p in all_pkts if p["threat_type"] == "Replay Attack"),
+                "mitm_suspected": sum(1 for p in all_pkts if p["threat_type"] == "MITM Suspected"),
+                "unauthorized": sum(
+                    1 for p in all_pkts if p["threat_type"] in ("Unauthorized Access", "Unauthorized Device")
+                ),
+                "rate_burst": sum(1 for p in all_pkts if p["threat_type"] == "Suspicious Traffic"),
+            }
+            return {
+                "summary": {
+                    "total_packets": len(all_pkts),
+                    "encrypted_pct": round((encrypted_count / len(all_pkts)) * 100, 1) if all_pkts else 100.0,
+                    "auth_integrity_pct": round((auth_ok_count / len(all_pkts)) * 100, 1) if all_pkts else 100.0,
+                    "trusted_count": sum(1 for dv in devices if dv["status"] == "Trusted"),
+                    "blocked_count": sum(1 for dv in devices if dv["status"] == "Blocked"),
+                    "threat_counts": threat_counts,
+                },
+                "packets": [
+                    {
+                        **p,
+                        "drone_name": all_drones[p["drone_id"]].name
+                        if p["drone_id"] in all_drones
+                        else "External / GCS",
+                    }
+                    for p in packets
+                ],
+                "devices": devices,
+            }
+
+    @router.post("/network/devices", status_code=201)
+    def add_trusted_device(payload: TrustedDeviceCreate):
+        with lock, engine.begin() as c:
+            uid = payload.device_uid.strip().upper()
+            exists = c.scalar(select(trusted_devices.c.id).where(trusted_devices.c.device_uid == uid))
+            if exists is not None:
+                raise HTTPException(409, f"Device {uid} already exists")
+            row_id = (
+                c.execute(
+                    trusted_devices.insert().values(
+                        device_uid=uid,
+                        name=payload.name.strip(),
+                        ip_address=payload.ip_address.strip(),
+                        mac_address=payload.mac_address.strip(),
+                        drone_id=payload.drone_id,
+                        status="Trusted",
+                        last_seen=now(),
+                    )
+                ).inserted_primary_key[0]
+            )
+            record_audit(c, "operator", "TRUST_DEVICE", uid, f"Added trusted device {payload.name.strip()}")
+            return c.execute(select(trusted_devices).where(trusted_devices.c.id == row_id)).mappings().one()
+
+    @router.post("/network/devices/{device_uid}/block")
+    def block_device(device_uid: str):
+        with lock, engine.begin() as c:
+            uid = device_uid.strip()
+            existing = c.execute(select(trusted_devices).where(trusted_devices.c.device_uid == uid)).mappings().first()
+            if existing:
+                c.execute(
+                    trusted_devices.update()
+                    .where(trusted_devices.c.device_uid == uid)
+                    .values(status="Blocked", last_seen=now())
+                )
+                target_drone = existing["drone_id"]
+            else:
+                c.execute(
+                    trusted_devices.insert().values(
+                        device_uid=uid,
+                        name=f"Blocked Node ({uid})",
+                        ip_address="192.168.99.204",
+                        mac_address="DE:AD:BE:EF:00:01",
+                        drone_id=None,
+                        status="Blocked",
+                        last_seen=now(),
+                    )
+                )
+                target_drone = None
+            c.execute(
+                network_packets.insert().values(
+                    drone_id=target_drone,
+                    time=now(),
+                    direction="Inbound",
+                    src_addr=existing["ip_address"] if existing else "192.168.99.204",
+                    dst_addr="10.42.0.1:8443",
+                    device_uid=uid,
+                    packet_size=64,
+                    protocol="ACL/DROP",
+                    encrypted=False,
+                    auth_status="Blocked",
+                    threat_type="Unauthorized Device",
+                    simulated=True,
+                    detail=f"Administrator blocked device {uid} on network firewall.",
+                )
+            )
+            if target_drone is not None:
+                log(c, target_drone, "Device blocked", f"Blocked network node {uid}.", "Medium", "Recorded", category="Network", simulated=True)
+            record_audit(c, "operator", "BLOCK_DEVICE", uid, f"Blocked simulated device {uid}")
+            return {"ok": True, "device_uid": uid, "status": "Blocked"}
+
+    @router.post("/network/devices/{device_uid}/trust")
+    def trust_device(device_uid: str):
+        with lock, engine.begin() as c:
+            uid = device_uid.strip()
+            existing = c.execute(select(trusted_devices).where(trusted_devices.c.device_uid == uid)).mappings().first()
+            if not existing:
+                raise HTTPException(404, "Device not found")
+            c.execute(
+                trusted_devices.update()
+                .where(trusted_devices.c.device_uid == uid)
+                .values(status="Trusted", last_seen=now())
+            )
+            record_audit(c, "operator", "TRUST_DEVICE", uid, f"Restored trust for {uid}")
+            return {"ok": True, "device_uid": uid, "status": "Trusted"}
 
     @router.get("/deviations")
     def list_deviations(drone_id: Optional[int] = None, severity: Optional[str] = None):

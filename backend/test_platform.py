@@ -71,3 +71,28 @@ def test_ml_analysis_endpoint(tmp_path):
         assert body["live_counts"]["spoofed"] >= 1
         spoofed = [p for p in body["predictions"] if p["classification"] == "GPS Spoofed"]
         assert len(spoofed) >= 1 and len(spoofed[0]["reason"]) > 10
+
+
+def test_network_monitoring_and_device_blocking(tmp_path):
+    engine = create_engine(f"sqlite:///{tmp_path / 'net.db'}")
+    metadata.create_all(engine)
+    with TestClient(create_app(engine)) as client:
+        client.post("/api/drones/0/commands", json={"action": "unknown"})
+        client.post("/api/drones/0/commands", json={"action": "integrity"})
+        overview = client.get("/api/network/overview").json()
+        assert overview["summary"]["total_packets"] >= 4
+        assert overview["summary"]["threat_counts"]["unauthorized"] >= 1
+        assert overview["summary"]["threat_counts"]["packet_injection"] >= 1
+
+        blk = client.post("/api/network/devices/UNKNOWN-NODE-FF/block")
+        assert blk.is_success
+        # Subsequent unknown traffic hits Blocked device
+        client.post("/api/drones/0/commands", json={"action": "unknown"})
+        after = client.get("/api/network/overview", params={"threat_only": True}).json()
+        assert any(p["auth_status"] == "Blocked" for p in after["packets"])
+
+        added = client.post(
+            "/api/network/devices",
+            json={"device_uid": "RELAY-01", "name": "Ground Relay", "ip_address": "10.42.1.88"},
+        )
+        assert added.status_code == 201
