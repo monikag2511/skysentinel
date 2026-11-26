@@ -1,78 +1,202 @@
 # SkySentinel
 
-## Production deployment
+SkySentinel is an integrated drone cybersecurity monitoring and GPS spoofing detection platform built with React, TypeScript, Leaflet, FastAPI, scikit-learn, SQLAlchemy, Alembic, and PostgreSQL (Neon).
 
-The production entry point serves the compiled dashboard and API from one origin. The sign-in usernames are `viewer` (inspect and export records) and `operator` (also run scenarios and acknowledge incidents). Configure separate generated passwords in `SKY_VIEWER_PASSWORD` and `SKY_OPERATOR_PASSWORD`. Rotate either password in the deployment secret store and restart the service to revoke its previous value. These are two shared role accounts for a small team.
+All flight trajectories, cyberattack scenarios, network threat packets, and recovery actions in this application are simulated for cybersecurity research, testing, and academic demonstration.
 
-1. Configure the Neon URLs and both role passwords in the deployment secret store. Supply the direct migration URL only to the release job. For public access, terminate HTTPS at the hosting ingress and restrict the application port to that ingress. Browser sign-in uses HTTP Basic over TLS.
-2. Build the image with `docker build -t skysentinel:release .`. The build uses the npm lockfile and pinned Python packages and excludes local credentials. Run `python -m alembic upgrade head` once as the release command with migration credentials.
-3. Run the image with the configured environment. It serves port 8000 as a non-root user. Use one instance and one worker for the simulator’s in-memory device keys and counters. Configure the ingress to throttle sign-in attempts and set a request-body limit. Point the readiness check at `/health/ready` and liveness at `/health/live`.
-4. Verify that anonymous requests to the dashboard receive 401, viewer commands receive 403, and a signed-in operator can complete the recovery demo. Confirm the Neon backup/restore policy and test a restore before opening the deployment to users.
+---
 
-For a local production preview, build the frontend, configure the four backend environment variables, then run this from `backend/`:
+## Technology Stack
 
-```powershell
-..\.venv\Scripts\python -m uvicorn production:production_app --factory --host 127.0.0.1 --port 8010
+- **Frontend**: React 19, TypeScript, Vite, Leaflet
+- **Backend**: FastAPI, Pydantic, Uvicorn, Cryptography (AES-256-GCM)
+- **Machine Learning**: scikit-learn (`RandomForestClassifier` with flight-level holdout evaluation)
+- **Database & Migrations**: PostgreSQL (Neon), SQLAlchemy 2.0, Alembic
+- **Testing & CI**: pytest, Playwright, Docker, GitHub Actions
+
+---
+
+## Core Modules
+
+1. **Security Dashboard & Flight Watch**
+   - Live fleet metrics: total registered drones, active drones, normal drones, drones under GPS spoofing attacks, detected cyberattacks, active critical/high alerts, and overall network and GPS security status.
+   - Real-time attack feed, latest drone telemetry stream, and interactive flight-watch controls.
+
+2. **Drone Management**
+   - Register new drones with unique IDs/codes (`DRN-001`, etc.), airframe models, battery, altitude, and base coordinates.
+   - View, search, filter, edit, and decommission registered drones, and inspect battery, speed, altitude, coordinates, GPS connectivity, and communication status.
+
+3. **Live GPS Tracking & Flight Path Deviation Detection**
+   - Multi-drone simultaneous trajectory map comparing planned flight corridors against reported GPS coordinates.
+   - Great-circle (Haversine) deviation calculation and sudden GPS jump detection against configurable thresholds, highlighting affected segments and warning markers on the map.
+
+4. **Intelligent GPS Spoofing Detection & ML Analysis**
+   - Combines a Random Forest classifier trained on six features (`latitude`, `longitude`, `speed`, `acceleration`, `gyroscope`, `signal`) with physical/IMU corridor checks.
+   - Displays accuracy, precision, recall, F1-score, confusion matrix, feature importance weights, normal vs. spoofed prediction counts, and per-reading classification explanations.
+
+5. **Secure Drone Communication & Network Traffic Monitoring**
+   - Seals and authenticates telemetry frames using per-device AES-256-GCM encryption and associated authenticated data (`device/sequence`).
+   - Monitors inbound and outbound packet logs (source/destination addresses, packet size, protocol, timestamps, authentication status).
+   - Detects unknown senders, integrity failures (packet injection), replay attacks, rate bursts, and simulated man-in-the-middle probes, and supports blocking/trusting simulated devices.
+
+6. **Attack Simulation Centre**
+   - Controlled cyber-range simulations clearly tagged as simulated (`[SIMULATED]`):
+     - GPS spoofing attack
+     - Unauthorized device access
+     - Packet injection attempt
+     - Replay attack
+     - Suspicious network traffic
+     - Abnormal drone location changes
+     - Communication interruption
+   - Each simulation executes end-to-end detection, alert generation, dashboard updates, logging, and recovery recommendation.
+
+7. **Autonomous Recovery System**
+   - Recommends recovery actions with reasoning when threats occur and supports operator execution of:
+     - Return to Home
+     - Attitude Hold
+     - Manual Override
+     - Emergency Motor Disarm
+     - Resume Patrol
+   - Records recovery status, outcomes, alerts, and audit history.
+
+8. **Real-Time Security Alert Centre**
+   - Auto-refreshing alerts with `Alert ID`, `Drone ID`, attack type, severity (`Critical`, `High`, `Medium`, `Low`), confidence, timestamp, description, and status (`Active`, `Acknowledged`, `Resolved`).
+   - Search, severity/attack-type filters, detail inspection, and optional Web Audio notifications for critical alerts.
+
+9. **Multi-Drone & Health Monitoring**
+   - Fleet-wide matrix monitoring battery, altitude, speed, GPS signal strength, network connectivity, sensor status, and flight status with automated health warnings and per-drone JSON security reports.
+
+10. **Security Analytics, Logs, PDF/CSV Reports & Admin Management**
+    - Interactive analytics charts for daily/weekly/monthly attack trends, attack/severity distributions, drone-wise stats, recovery counts, and network traffic, filterable by date and drone.
+    - Unified searchable security logs and database archive with JSON export.
+    - Executive report generation with downloadable **PDF** and **CSV** exports covering all seven operational and ML sections.
+    - Admin management with login/logout, role enforcement (`operator`/`admin` vs. read-only `viewer`), configurable detection thresholds, and system audit logs.
+
+---
+
+## Project Structure
+
+```text
+backend/
+  db.py                  # SQLAlchemy Core schema (drones, telemetry, events, alerts, deviations, network_packets, trusted_devices, recoveries, system_settings, audit_logs)
+  main.py                # FastAPI application factory, Flight Watch commands, auth session endpoints
+  production.py          # Single-origin production entry point (HTTP Basic auth, security headers, static frontend)
+  routes_platform.py     # Platform API routers (dashboard, drones CRUD, ML, deviations, network, simulations, alerts, recovery, analytics, logs, reports, admin)
+  service.py             # AES-256-GCM telemetry verification, deviation/spoofing analysis, alert & audit helpers
+  model.py               # Synthetic flight dataset generator and Random Forest training/evaluation
+  reports.py             # PDF 1.4 and CSV security report generators
+  migrations/            # Alembic configuration and schema revisions (001, 002)
+  test_watch.py          # Core flight watch API tests
+  test_production.py     # Production auth, archive, and health endpoint tests
+  test_platform.py       # Platform integration tests (CRUD, ML, network, simulations, recovery, analytics, PDF/CSV, admin)
+frontend/
+  src/
+    main.tsx             # Application shell, sidebar navigation, Flight Watch workspace
+    Chart.tsx            # Interactive Leaflet trajectory & deviation map
+    Archive.tsx          # Paginated database incident archive search
+    types.ts             # Shared TypeScript interfaces
+    style.css            # Dark cybersecurity UI theme and responsive layout
+    pages/               # Modular pages for Dashboard, Tracking, Drones, ML, Deviations, Network, Simulation, Recovery, Alerts, Health, Analytics, Logs, Reports, Admin
+  e2e.spec.ts            # End-to-end Playwright browser tests
+  production.spec.ts     # Authenticated viewer/operator Playwright tests
+Dockerfile               # Multi-stage Node + Python production container
 ```
 
-The incident ledger includes a searchable archive across the database. Search by event, detail, status or aircraft and optionally filter severity. Each page has up to 25 records. Export downloads exactly the loaded results as JSON.
+---
 
-### Verify a release
+## Environment Configuration
 
-The GitHub Actions workflow builds the image and runs a migrated, disposable PostgreSQL instance and Chromium browser tests. It uses CI-only credentials. To run the authenticated browser suite against a local preview, run the following from `frontend/`. The operator tests create simulated events in the configured database.
+Copy `backend/.env.example` to `backend/.env` and configure:
 
-```powershell
-$env:SKY_PRODUCTION_TEST = "1"
-$env:FRONTEND_URL = "http://127.0.0.1:8010"
-node --env-file=../backend/.env node_modules/@playwright/test/cli.js test
-```
+- `DATABASE_URL`: Pooled PostgreSQL connection string (with TLS/SSL required for Neon).
+- `MIGRATION_DATABASE_URL`: Direct PostgreSQL connection string for Alembic migrations.
+- `SKY_OPERATOR_PASSWORD`: Password for the `operator` / `admin` role (at least 20 characters required in production mode).
+- `SKY_VIEWER_PASSWORD`: Distinct password for the read-only `viewer` role (at least 20 characters required in production mode).
 
-For rollback, retain the previous image digest. This release adds no database migrations. Redeploy the previous image if the readiness probe or recovery smoke test fails. For future schema changes, verify backward compatibility before rolling the application back.
+---
 
-A dark-theme drone cybersecurity command platform built with React, TypeScript, Leaflet, FastAPI, scikit-learn, and PostgreSQL (Neon). Modules include the Security Dashboard, Drone Management (CRUD), Live Multi-Drone GPS Tracking, Intelligent GPS Spoofing & ML Analysis, Flight Path Deviation Detection, Secure AES-256-GCM Communication & Network Traffic Monitoring, Attack Simulation Centre, Autonomous Recovery, Real-Time Security Alert Centre, Multi-Drone & Health Monitoring, Security Analytics, Security Logs, PDF/CSV Report Generation, and Admin Management.
+## Setup and Running on Windows
 
-## Start on Windows
-From the repository root, create the virtual environment and install the backend once.
+### 1. First-Time Setup
+
+From the repository root:
 
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\python -m pip install -r backend/requirements.txt
+
+cd frontend
+npm.cmd ci
+cd ..
 ```
 
-Set DATABASE_URL in backend/.env using the pooled Neon connection string. Set MIGRATION_DATABASE_URL to the direct connection URI for the same database. The example file contains the variable names. Both connections require TLS.
-
-In a PowerShell terminal, start the API from the repository root.
+Apply database migrations:
 
 ```powershell
 cd backend
 ..\.venv\Scripts\python -m alembic upgrade head
+cd ..
+```
+
+### 2. Development Mode (Two Terminals)
+
+Terminal 1 (FastAPI API on port `8000`):
+
+```powershell
+cd backend
 ..\.venv\Scripts\python -m uvicorn main:create_app --factory --host 127.0.0.1 --port 8000
 ```
 
-In a second terminal, start the console.
+Terminal 2 (React + Vite console on port `5173`, proxying `/api` to port `8000`):
 
 ```powershell
 cd frontend
-npm.cmd ci
 npm.cmd run dev
 ```
 
-Open http://127.0.0.1:5173. The local Vite server proxies /api to FastAPI. Use one API worker for this simulator. Device encryption keys and burst counters are per-process. Persistent sequence numbers and incident history live in PostgreSQL.
+Open `http://127.0.0.1:5173`. Use `--workers 1` (default) because per-device AES keys and burst-rate windows are held in process memory.
 
-## Demonstration
-1. Select an aircraft and run Normal flight. Start continuous patrol to advance the selected flight every 3.5 seconds while the dashboard is open. Pause it before switching scenarios.
-2. Run Duplicate sequence, Unknown sender or Integrity failure. Find the rejection in the ledger and acknowledge it. The last trusted fix stays in place.
-3. Run GPS deviation. Inspect the reported position, model score and hold event. Select Return to base, then Resume patrol. Refresh to inspect the persisted incident.
-4. Select View test results for model metrics. Execute python model.py from the backend directory for the complete confusion matrix and per-class report.
+### 3. Production Preview (Single Origin)
 
-A trace shows up to 32 readings per drone. The ledger displays the latest 100 events. Data is synthetic and recovery actions update the simulator. The network module exercises authenticated messages in memory. Wireshark can inspect local browser/API HTTP exchanges on a loopback capture or the TLS connection to Neon; those are application links, not radio traffic.
-
-## Checks
-Run the following from the repository root. The API test uses a disposable database. The browser test requires the two running servers and Microsoft Edge and creates demonstration events in the configured database.
+Build the frontend and run the production FastAPI entry point:
 
 ```powershell
-.\.venv\Scripts\python -m pytest backend
 cd frontend
 npm.cmd run build
+cd ..\backend
+..\.venv\Scripts\python -m uvicorn production:production_app --factory --host 127.0.0.1 --port 8010
+```
+
+Open `http://127.0.0.1:8010` and authenticate via HTTP Basic using `operator` or `viewer` credentials from `backend/.env`.
+
+### 4. Docker Deployment
+
+```powershell
+docker build -t skysentinel:release .
+```
+
+Run migrations with `MIGRATION_DATABASE_URL` during release (`python -m alembic upgrade head`), then run the container on port `8000` behind a TLS reverse proxy with `/health/live` and `/health/ready` health probes.
+
+---
+
+## Verification and Testing
+
+From the repository root:
+
+```powershell
+# Backend unit and integration tests (uses isolated temporary databases)
+.\.venv\Scripts\python -m pytest backend
+
+# Frontend TypeScript check and production build
+cd frontend
+npm.cmd run build
+
+# End-to-end browser tests (requires running backend and frontend)
 npx.cmd playwright test
+```
+
+To run the standalone Random Forest evaluation report from `backend/`:
+
+```powershell
+..\.venv\Scripts\python model.py
 ```
