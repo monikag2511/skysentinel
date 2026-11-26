@@ -1,0 +1,44 @@
+name: Verify SkySentinel
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_PASSWORD: ci-only
+        ports: ["5432:5432"]
+        options: --health-cmd pg_isready --health-interval 5s --health-timeout 3s --health-retries 10
+    env:
+      DATABASE_URL: postgresql://postgres:ci-only@localhost:5432/postgres
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.13"}
+      - uses: actions/setup-node@v4
+        with: {node-version: "24"}
+      - run: pip install -r backend/requirements.lock
+      - run: python -m alembic upgrade head
+        working-directory: backend
+      - run: python -m pytest backend
+      - run: npm ci && npm run build
+        working-directory: frontend
+      - run: docker build -t skysentinel:test .
+      - name: Verify image against PostgreSQL
+        run: |
+          docker run -d --name sky --network host -e DATABASE_URL -e SKY_OPERATOR_PASSWORD=ci-only-operator-secret -e SKY_VIEWER_PASSWORD=ci-only-readonly-secret skysentinel:test
+          curl --fail --retry 30 --retry-all-errors --retry-delay 2 http://localhost:8000/health/ready
+          curl --fail -u viewer:ci-only-readonly-secret http://localhost:8000/api/watch
+      - name: Exercise the production console
+        working-directory: frontend
+        env:
+          SKY_PRODUCTION_TEST: "1"
+          FRONTEND_URL: http://localhost:8000
+          SKY_OPERATOR_PASSWORD: ci-only-operator-secret
+          SKY_VIEWER_PASSWORD: ci-only-readonly-secret
+        run: |
+          npx playwright install --with-deps chromium
+          npx playwright test
