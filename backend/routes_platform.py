@@ -87,12 +87,24 @@ class DroneUpdate(BaseModel):
 def build_platform_router(engine, lock, watch):
     router = APIRouter(prefix="/api", tags=["platform"])
 
-    def _compute_drone_health(c, d, thresholds):
-        latest = (
-            c.execute(select(samples).where(samples.c.drone == d.id).order_by(samples.c.seq.desc()).limit(1))
-            .mappings()
-            .first()
-        )
+    def _compute_drone_health(c, d, thresholds, latest_sample=None, recent_net_threat=None, preloaded=False):
+        if not preloaded:
+            latest_sample = (
+                c.execute(select(samples).where(samples.c.drone == d.id).order_by(samples.c.seq.desc()).limit(1))
+                .mappings()
+                .first()
+            )
+            recent_net_threat = (
+                c.execute(
+                    select(network_packets)
+                    .where(network_packets.c.drone_id == d.id, network_packets.c.threat_type.is_not(None))
+                    .order_by(network_packets.c.id.desc())
+                    .limit(1)
+                )
+                .mappings()
+                .first()
+            )
+        latest = latest_sample
         reading_data = latest["reading"] if latest else {}
         speed = float(reading_data.get("speed", 0.0))
         signal = float(reading_data.get("signal", 100.0))
@@ -112,17 +124,6 @@ def build_platform_router(engine, lock, watch):
             warnings.append(f"Abnormal flight speed ({speed:.1f} km/h)")
         if signal < 75.0:
             warnings.append(f"Weak GPS signal ({signal:.1f}%)")
-
-        recent_net_threat = (
-            c.execute(
-                select(network_packets)
-                .where(network_packets.c.drone_id == d.id, network_packets.c.threat_type.is_not(None))
-                .order_by(network_packets.c.id.desc())
-                .limit(1)
-            )
-            .mappings()
-            .first()
-        )
 
         if not d.is_active:
             sec_status = "Offline"
@@ -160,13 +161,39 @@ def build_platform_router(engine, lock, watch):
             "last_seen": latest["time"] if latest else d.created_at,
         }
 
+    def _bulk_health(c, all_drones, thresholds):
+        latest_by_drone = {}
+        for s in c.execute(select(samples).order_by(samples.c.seq.desc()).limit(250)).mappings():
+            if s["drone"] not in latest_by_drone:
+                latest_by_drone[s["drone"]] = s
+        threat_by_drone = {}
+        for p in c.execute(
+            select(network_packets)
+            .where(network_packets.c.threat_type.is_not(None))
+            .order_by(network_packets.c.id.desc())
+            .limit(100)
+        ).mappings():
+            if p["drone_id"] is not None and p["drone_id"] not in threat_by_drone:
+                threat_by_drone[p["drone_id"]] = p
+        return [
+            _compute_drone_health(
+                c,
+                d,
+                thresholds,
+                latest_sample=latest_by_drone.get(d.id),
+                recent_net_threat=threat_by_drone.get(d.id),
+                preloaded=True,
+            )
+            for d in all_drones
+        ]
+
     @router.get("/dashboard")
     def dashboard():
-        with lock, engine.connect() as c:
+        with engine.connect() as c:
             thresholds = get_thresholds(c)
             all_drones = c.execute(select(drones).order_by(drones.c.id)).mappings().all()
             drone_map = {d.id: d for d in all_drones}
-            health_rows = [_compute_drone_health(c, d, thresholds) for d in all_drones]
+            health_rows = _bulk_health(c, all_drones, thresholds)
 
             all_alerts = c.execute(select(alerts).order_by(alerts.c.id.desc())).mappings().all()
             attack_alerts = [a for a in all_alerts if a["attack_type"] != "Recovery Initiated"]
@@ -252,10 +279,10 @@ def build_platform_router(engine, lock, watch):
 
     @router.get("/drones")
     def list_drones(q: str = Query("", max_length=64), status: str = Query("")):
-        with lock, engine.connect() as c:
+        with engine.connect() as c:
             thresholds = get_thresholds(c)
             rows = c.execute(select(drones).order_by(drones.c.id)).mappings().all()
-            health = [_compute_drone_health(c, d, thresholds) for d in rows]
+            health = _bulk_health(c, rows, thresholds)
             if q.strip():
                 needle = q.strip().lower()
                 health = [
@@ -369,7 +396,7 @@ def build_platform_router(engine, lock, watch):
 
     @router.get("/drones/{device}/report")
     def drone_report(device: int):
-        with lock, engine.connect() as c:
+        with engine.connect() as c:
             d = c.execute(select(drones).where(drones.c.id == device)).mappings().first()
             if not d:
                 raise HTTPException(404, "Drone not found")
@@ -419,7 +446,7 @@ def build_platform_router(engine, lock, watch):
 
     @router.get("/ml/analysis")
     def ml_analysis(drone_id: Optional[int] = None, classification: Optional[str] = None):
-        with lock, engine.connect() as c:
+        with engine.connect() as c:
             all_drones = {d.id: d for d in c.execute(select(drones)).mappings()}
             all_rows = c.execute(select(samples).order_by(samples.c.id.desc()).limit(250)).mappings().all()
             normal_count = sum(1 for r in all_rows if r["classification"] == "Normal")
@@ -450,7 +477,7 @@ def build_platform_router(engine, lock, watch):
 
     @router.get("/network/overview")
     def network_overview(direction: Optional[str] = None, threat_only: bool = False):
-        with lock, engine.connect() as c:
+        with engine.connect() as c:
             all_drones = {d.id: d for d in c.execute(select(drones)).mappings()}
             pkt_q = select(network_packets).order_by(network_packets.c.id.desc()).limit(120)
             if direction in ("Inbound", "Outbound"):
@@ -769,7 +796,7 @@ def build_platform_router(engine, lock, watch):
         attack_type: Optional[str] = None,
         status: Optional[str] = None,
     ):
-        with lock, engine.connect() as c:
+        with engine.connect() as c:
             all_drones = {d.id: d for d in c.execute(select(drones)).mappings()}
             query = select(alerts).order_by(alerts.c.id.desc()).limit(200)
             if severity:
@@ -821,7 +848,7 @@ def build_platform_router(engine, lock, watch):
 
     @router.get("/recoveries")
     def list_recoveries():
-        with lock, engine.connect() as c:
+        with engine.connect() as c:
             all_drones = {d.id: d for d in c.execute(select(drones)).mappings()}
             rows = c.execute(select(recoveries).order_by(recoveries.c.id.desc()).limit(100)).mappings().all()
             return {
@@ -937,7 +964,7 @@ def build_platform_router(engine, lock, watch):
 
     @router.get("/deviations")
     def list_deviations(drone_id: Optional[int] = None, severity: Optional[str] = None):
-        with lock, engine.connect() as c:
+        with engine.connect() as c:
             all_drones = {d.id: d for d in c.execute(select(drones)).mappings()}
             q = select(deviations).order_by(deviations.c.id.desc()).limit(100)
             if drone_id is not None:
@@ -967,7 +994,7 @@ def build_platform_router(engine, lock, watch):
     def _build_report_summary(c):
         thresholds = get_thresholds(c)
         all_drones = c.execute(select(drones).order_by(drones.c.id)).mappings().all()
-        health_rows = [_compute_drone_health(c, d, thresholds) for d in all_drones]
+        health_rows = _bulk_health(c, all_drones, thresholds)
         all_samples = c.execute(select(samples)).mappings().all()
         all_alerts = c.execute(select(alerts).order_by(alerts.c.id.desc())).mappings().all()
         all_packets = c.execute(select(network_packets)).mappings().all()
@@ -1013,7 +1040,7 @@ def build_platform_router(engine, lock, watch):
         date_from: Optional[str] = None,
         date_to: Optional[str] = None,
     ):
-        with lock, engine.connect() as c:
+        with engine.connect() as c:
             all_drones = {d.id: d for d in c.execute(select(drones)).mappings()}
             all_alerts = [
                 a
@@ -1093,7 +1120,7 @@ def build_platform_router(engine, lock, watch):
         date_from: Optional[str] = None,
         date_to: Optional[str] = None,
     ):
-        with lock, engine.connect() as c:
+        with engine.connect() as c:
             all_drones = {d.id: d for d in c.execute(select(drones)).mappings()}
             rows = c.execute(select(events).order_by(events.c.id.desc()).limit(300)).mappings().all()
             needle = q.strip().lower()
@@ -1122,12 +1149,12 @@ def build_platform_router(engine, lock, watch):
 
     @router.get("/reports/summary")
     def report_summary():
-        with lock, engine.connect() as c:
+        with engine.connect() as c:
             return _build_report_summary(c)
 
     @router.get("/reports/export")
     def report_export(format: Literal["pdf", "csv"] = "pdf"):
-        with lock, engine.connect() as c:
+        with engine.connect() as c:
             summary = _build_report_summary(c)
         if format == "csv":
             csv_data = build_csv_report(summary)
@@ -1145,7 +1172,7 @@ def build_platform_router(engine, lock, watch):
 
     @router.get("/admin/settings")
     def get_admin_settings():
-        with lock, engine.connect() as c:
+        with engine.connect() as c:
             return {"thresholds": get_thresholds(c)}
 
     @router.put("/admin/settings")
@@ -1162,7 +1189,7 @@ def build_platform_router(engine, lock, watch):
 
     @router.get("/admin/audit-logs")
     def get_audit_logs():
-        with lock, engine.connect() as c:
+        with engine.connect() as c:
             rows = c.execute(select(audit_logs).order_by(audit_logs.c.id.desc()).limit(100)).mappings().all()
             return {"items": rows}
 

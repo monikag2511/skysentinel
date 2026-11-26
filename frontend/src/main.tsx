@@ -89,51 +89,58 @@ function App() {
     >;
   } | null>(null);
   const pending = useRef(false);
+  const refreshing = useRef(false);
   const version = useRef(0);
 
   async function refresh() {
+    if (refreshing.current) return;
+    refreshing.current = true;
     const ticket = ++version.current;
-    const [watchData, dashData] = await Promise.all([
-      request("watch"),
-      request("dashboard").catch(() => null),
-    ]);
-    if (ticket === version.current) {
-      setSnapshot(watchData);
-      if (dashData) {
-        setDashboard(dashData);
-        const newestCrit = dashData.recent_attacks.find(
-          (a: { severity: string; status: string; id: number }) =>
-            a.severity === "Critical" && a.status === "Active",
-        );
-        if (newestCrit && newestCrit.id > lastCriticalId.current) {
-          if (lastCriticalId.current !== 0 && soundEnabled) {
-            try {
-              const ctx = new AudioContext();
-              const osc = ctx.createOscillator();
-              const gain = ctx.createGain();
-              osc.type = "triangle";
-              osc.frequency.setValueAtTime(880, ctx.currentTime);
-              gain.gain.setValueAtTime(0.08, ctx.currentTime);
-              osc.connect(gain);
-              gain.connect(ctx.destination);
-              osc.start();
-              osc.stop(ctx.currentTime + 0.25);
-            } catch {
-              // AudioContext may require prior user gesture
+    try {
+      const [watchData, dashData] = await Promise.all([
+        request("watch"),
+        request("dashboard").catch(() => null),
+      ]);
+      if (ticket === version.current) {
+        setSnapshot(watchData);
+        if (dashData) {
+          setDashboard(dashData);
+          const newestCrit = dashData.recent_attacks.find(
+            (a: { severity: string; status: string; id: number }) =>
+              a.severity === "Critical" && a.status === "Active",
+          );
+          if (newestCrit && newestCrit.id > lastCriticalId.current) {
+            if (lastCriticalId.current !== 0 && soundEnabled) {
+              try {
+                const ctx = new AudioContext();
+                const osc = ctx.createOscillator();
+                const gain = ctx.createGain();
+                osc.type = "triangle";
+                osc.frequency.setValueAtTime(880, ctx.currentTime);
+                gain.gain.setValueAtTime(0.08, ctx.currentTime);
+                osc.connect(gain);
+                gain.connect(ctx.destination);
+                osc.start();
+                osc.stop(ctx.currentTime + 0.25);
+              } catch {
+                // AudioContext may require prior user gesture
+              }
             }
+            lastCriticalId.current = newestCrit.id;
           }
-          lastCriticalId.current = newestCrit.id;
         }
+        fail("");
       }
-      fail("");
+    } finally {
+      refreshing.current = false;
     }
   }
 
   useEffect(() => {
     refresh().catch((e) => fail(e.message));
     const t = setInterval(() => {
-      if (!pending.current) refresh().catch((e) => fail(e.message));
-    }, 6000);
+      if (!pending.current && !refreshing.current) refresh().catch((e) => fail(e.message));
+    }, 8000);
     return () => clearInterval(t);
   }, []);
 

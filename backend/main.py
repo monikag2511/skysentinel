@@ -92,14 +92,17 @@ def create_app(engine=None, *, docs=True):
 
     @app.get("/api/watch")
     def snapshot(request: Request):
-        with lock, engine.begin() as c:
+        with engine.connect() as c:
+            drone_rows = c.execute(select(drones).order_by(drones.c.id)).mappings().all()
+            sample_rows = c.execute(select(samples).order_by(samples.c.seq.desc()).limit(250)).mappings().all()
+            by_drone: dict[int, list] = {}
+            for s in sample_rows:
+                bucket = by_drone.setdefault(s["drone"], [])
+                if len(bucket) < 32:
+                    bucket.append(s)
             fleet = []
-            for row in c.execute(select(drones).order_by(drones.c.id)).mappings():
-                track = (
-                    c.execute(select(samples).where(samples.c.drone == row.id).order_by(samples.c.seq.desc()).limit(32))
-                    .mappings()
-                    .all()
-                )
+            for row in drone_rows:
+                track = by_drone.get(row.id, [])
                 fleet.append(
                     {
                         **row,
