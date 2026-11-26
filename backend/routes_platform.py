@@ -12,7 +12,7 @@ from db import (
     samples,
     trusted_devices,
 )
-from model import position
+from model import position, trained
 from service import get_thresholds, log, now, record_audit
 
 
@@ -372,6 +372,37 @@ def build_platform_router(engine, lock, watch):
                 "deviations": drone_deviations,
                 "packets": drone_packets,
                 "recoveries": drone_recoveries,
+            }
+
+    @router.get("/ml/analysis")
+    def ml_analysis(drone_id: Optional[int] = None, classification: Optional[str] = None):
+        with lock, engine.connect() as c:
+            all_drones = {d.id: d for d in c.execute(select(drones)).mappings()}
+            all_rows = c.execute(select(samples).order_by(samples.c.id.desc()).limit(250)).mappings().all()
+            normal_count = sum(1 for r in all_rows if r["classification"] == "Normal")
+            spoofed_count = sum(1 for r in all_rows if r["classification"] == "GPS Spoofed")
+            filtered = all_rows
+            if drone_id is not None:
+                filtered = [r for r in filtered if r["drone"] == drone_id]
+            if classification:
+                filtered = [r for r in filtered if r["classification"] == classification]
+
+            eval_report = trained()[1]
+            return {
+                "evaluation": eval_report,
+                "live_counts": {
+                    "total": len(all_rows),
+                    "normal": normal_count,
+                    "spoofed": spoofed_count,
+                },
+                "predictions": [
+                    {
+                        **r,
+                        "drone_name": all_drones[r["drone"]].name if r["drone"] in all_drones else f"Drone {r['drone']}",
+                        "drone_code": all_drones[r["drone"]].code if r["drone"] in all_drones else "DRN",
+                    }
+                    for r in filtered[:80]
+                ],
             }
 
     @router.get("/deviations")

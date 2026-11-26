@@ -352,6 +352,8 @@ class FlightWatch:
             reasons.append(f"Abnormal velocity {row['speed']:.1f} km/h vs IMU corridor")
         if row["acceleration"] > float(thresholds["accel_threshold_ms2"]):
             reasons.append(f"IMU acceleration spike {row['acceleration']:.2f} m/s^2")
+        if row["gyroscope"] > 0.85:
+            reasons.append(f"Gyroscope drift {row['gyroscope']:.2f} rad/s inconsistent with GPS heading")
         if row["signal"] < 75.0:
             reasons.append(f"Suspicious GPS signal drop ({row['signal']:.1f}%)")
         if jump_m > max(float(thresholds["deviation_threshold_m"]) * 1.3, 200.0):

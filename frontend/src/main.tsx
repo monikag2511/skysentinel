@@ -7,6 +7,7 @@ import { FleetHealthPage } from "./pages/FleetHealthPage";
 import { DroneManagementPage } from "./pages/DroneManagementPage";
 import { LiveTrackingPage } from "./pages/LiveTrackingPage";
 import { DeviationsPage } from "./pages/DeviationsPage";
+import { MlAnalysisPage } from "./pages/MlAnalysisPage";
 import type { DashboardData, Drone, NavSection, Reading, Snapshot } from "./types";
 import "./style.css";
 
@@ -278,6 +279,8 @@ function App() {
                 selected={d}
                 onSelect={(droneId) => select(droneId)}
               />
+            ) : section === "ml" ? (
+              <MlAnalysisPage fleet={snapshot.fleet} requestApi={request} />
             ) : section === "deviations" ? (
               <DeviationsPage
                 fleet={snapshot.fleet}

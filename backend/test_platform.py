@@ -56,3 +56,18 @@ def test_drone_crud_and_deviations(tmp_path):
         deleted = client.delete(f"/api/drones/{d_id}")
         assert deleted.is_success
         assert client.get(f"/api/drones/{d_id}/report").status_code == 404
+
+
+def test_ml_analysis_endpoint(tmp_path):
+    engine = create_engine(f"sqlite:///{tmp_path / 'ml.db'}")
+    metadata.create_all(engine)
+    with TestClient(create_app(engine)) as client:
+        client.post("/api/drones/0/commands", json={"action": "gps"})
+        res = client.get("/api/ml/analysis")
+        assert res.is_success, res.text
+        body = res.json()
+        assert body["evaluation"]["accuracy"] > 0.95
+        assert len(body["evaluation"]["importance"]) == 6
+        assert body["live_counts"]["spoofed"] >= 1
+        spoofed = [p for p in body["predictions"] if p["classification"] == "GPS Spoofed"]
+        assert len(spoofed) >= 1 and len(spoofed[0]["reason"]) > 10
