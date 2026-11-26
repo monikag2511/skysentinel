@@ -12,6 +12,10 @@ import { NetworkSecurityPage } from "./pages/NetworkSecurityPage";
 import { SimulationPage } from "./pages/SimulationPage";
 import { RecoveryPage } from "./pages/RecoveryPage";
 import { AlertsPage } from "./pages/AlertsPage";
+import { AnalyticsPage } from "./pages/AnalyticsPage";
+import { LogsPage } from "./pages/LogsPage";
+import { ReportsPage } from "./pages/ReportsPage";
+import { AdminPage } from "./pages/AdminPage";
 import type { DashboardData, Drone, NavSection, Reading, Snapshot } from "./types";
 import "./style.css";
 
@@ -226,6 +230,13 @@ function App() {
             </span>
           </div>
           <div className="topbar-right">
+            <button
+              onClick={() => setSoundEnabled(!soundEnabled)}
+              title="Toggle critical alert audio"
+              style={{ padding: "0.25rem 0.6rem", fontSize: "0.78rem" }}
+            >
+              {soundEnabled ? "🔊 Alerts" : "🔇 Muted"}
+            </button>
             {dashboard && (
               <>
                 <span
@@ -340,6 +351,19 @@ function App() {
                 onToggleSound={() => setSoundEnabled(!soundEnabled)}
                 requestApi={request}
                 onChanged={refresh}
+              />
+            ) : section === "analytics" ? (
+              <AnalyticsPage fleet={snapshot.fleet} requestApi={request} />
+            ) : section === "logs" ? (
+              <LogsPage fleet={snapshot.fleet} requestApi={request} />
+            ) : section === "reports" ? (
+              <ReportsPage requestApi={request} />
+            ) : section === "admin" ? (
+              <AdminPage
+                role={snapshot.role}
+                requestApi={request}
+                onChanged={refresh}
+                onNavigate={(s) => setSection(s)}
               />
             ) : section === "deviations" ? (
               <DeviationsPage

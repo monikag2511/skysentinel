@@ -1,19 +1,25 @@
+from collections import Counter
+from datetime import datetime
 from time import monotonic
 from typing import Literal, Optional
 from fastapi import APIRouter, HTTPException, Query
+from fastapi.responses import Response
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 from db import (
     alerts,
+    audit_logs,
     deviations,
     drones,
     events,
     network_packets,
     recoveries,
     samples,
+    system_settings,
     trusted_devices,
 )
 from model import position, reading, trained
+from reports import build_csv_report, build_pdf_report
 from service import create_alert, get_thresholds, log, now, record_audit
 
 
@@ -54,6 +60,15 @@ class RecoveryActionRequest(BaseModel):
     action: Literal["Return to Home", "Attitude Hold", "Manual Override", "Emergency Motor Disarm", "Resume Patrol"]
     recovery_id: Optional[int] = None
     reason: Optional[str] = None
+
+
+class ThresholdSettings(BaseModel):
+    deviation_threshold_m: float = Field(150.0, ge=10.0, le=5000.0)
+    spoof_score_threshold: float = Field(0.5, ge=0.1, le=0.99)
+    speed_threshold_kmh: float = Field(45.0, ge=10.0, le=300.0)
+    accel_threshold_ms2: float = Field(3.5, ge=0.5, le=50.0)
+    rate_limit_per_sec: int = Field(8, ge=1, le=100)
+    low_battery_pct: float = Field(25.0, ge=5.0, le=90.0)
 
 
 class DroneUpdate(BaseModel):
@@ -940,5 +955,215 @@ def build_platform_router(engine, lock, watch):
                     for r in rows
                 ]
             }
+
+    def _in_date_range(ts: str, date_from: Optional[str], date_to: Optional[str]) -> bool:
+        day = (ts or "")[:10]
+        if date_from and day < date_from:
+            return False
+        if date_to and day > date_to:
+            return False
+        return True
+
+    def _build_report_summary(c):
+        thresholds = get_thresholds(c)
+        all_drones = c.execute(select(drones).order_by(drones.c.id)).mappings().all()
+        health_rows = [_compute_drone_health(c, d, thresholds) for d in all_drones]
+        all_samples = c.execute(select(samples)).mappings().all()
+        all_alerts = c.execute(select(alerts).order_by(alerts.c.id.desc())).mappings().all()
+        all_packets = c.execute(select(network_packets)).mappings().all()
+        all_devs = c.execute(select(deviations)).mappings().all()
+        all_recs = c.execute(select(recoveries).order_by(recoveries.c.id.desc())).mappings().all()
+        blocked_devs = c.execute(select(trusted_devices).where(trusted_devices.c.status == "Blocked")).mappings().all()
+        ev = trained()[1]
+        attack_counts = Counter(a["attack_type"] for a in all_alerts if a["attack_type"] != "Recovery Initiated")
+        return {
+            "overview": {
+                "total_drones": len(all_drones),
+                "active_drones": sum(1 for d in all_drones if d["is_active"] and d["mode"] != "At base"),
+                "spoofed_drones": sum(1 for h in health_rows if h["security_status"] == "GPS Spoofed"),
+            },
+            "drones": health_rows,
+            "gps_detection": {
+                "normal_count": sum(1 for s in all_samples if s["classification"] == "Normal"),
+                "spoofed_count": sum(1 for s in all_samples if s["classification"] == "GPS Spoofed"),
+                "deviation_count": len(all_devs),
+            },
+            "network": {
+                "total_packets": len(all_packets),
+                "threat_packets": sum(1 for p in all_packets if p["threat_type"] is not None),
+                "blocked_devices": len(blocked_devs),
+            },
+            "attack_stats": dict(attack_counts),
+            "alerts": [dict(a) for a in all_alerts[:50]],
+            "recoveries": [dict(r) for r in all_recs[:50]],
+            "ml_performance": {
+                "accuracy": ev["accuracy"],
+                "precision": ev["metrics"]["1"]["precision"],
+                "recall": ev["metrics"]["1"]["recall"],
+                "f1": ev["metrics"]["1"]["f1-score"],
+                "confusion_matrix": ev["confusion_matrix"],
+                "train": ev["train"],
+                "test": ev["test"],
+            },
+        }
+
+    @router.get("/analytics")
+    def analytics(
+        drone_id: Optional[int] = None,
+        date_from: Optional[str] = None,
+        date_to: Optional[str] = None,
+    ):
+        with lock, engine.connect() as c:
+            all_drones = {d.id: d for d in c.execute(select(drones)).mappings()}
+            all_alerts = [
+                a
+                for a in c.execute(select(alerts)).mappings()
+                if (drone_id is None or a["drone_id"] == drone_id)
+                and _in_date_range(a["created_at"], date_from, date_to)
+                and a["attack_type"] != "Recovery Initiated"
+            ]
+            all_samples = [
+                s
+                for s in c.execute(select(samples)).mappings()
+                if (drone_id is None or s["drone"] == drone_id)
+                and _in_date_range(s["time"], date_from, date_to)
+            ]
+            all_recs = [
+                r
+                for r in c.execute(select(recoveries)).mappings()
+                if (drone_id is None or r["drone_id"] == drone_id)
+                and _in_date_range(r["created_at"], date_from, date_to)
+            ]
+            all_pkts = [
+                p
+                for p in c.execute(select(network_packets)).mappings()
+                if (drone_id is None or p["drone_id"] == drone_id)
+                and _in_date_range(p["time"], date_from, date_to)
+            ]
+
+            daily = Counter()
+            weekly = Counter()
+            monthly = Counter()
+            for a in all_alerts:
+                day = a["created_at"][:10]
+                daily[day] += 1
+                try:
+                    dt = datetime.fromisoformat(a["created_at"].replace("Z", "+00:00"))
+                    iso_year, iso_week, _ = dt.isocalendar()
+                    weekly[f"{iso_year}-W{iso_week:02d}"] += 1
+                    monthly[dt.strftime("%Y-%m")] += 1
+                except ValueError:
+                    pass
+
+            by_type = Counter(a["attack_type"] for a in all_alerts)
+            by_severity = Counter(a["severity"] for a in all_alerts)
+            by_drone = Counter(
+                all_drones[a["drone_id"]].name if a["drone_id"] in all_drones else "Fleet" for a in all_alerts
+            )
+            rec_stats = Counter((r["selected_action"] or r["recommended_action"]) for r in all_recs)
+
+            return {
+                "daily": [{"label": k, "count": v} for k, v in sorted(daily.items())],
+                "weekly": [{"label": k, "count": v} for k, v in sorted(weekly.items())],
+                "monthly": [{"label": k, "count": v} for k, v in sorted(monthly.items())],
+                "gps_vs_normal": {
+                    "Normal": sum(1 for s in all_samples if s["classification"] == "Normal"),
+                    "GPS Spoofed": sum(1 for s in all_samples if s["classification"] == "GPS Spoofed"),
+                },
+                "attack_distribution": [{"label": k, "count": v} for k, v in by_type.most_common()],
+                "severity_distribution": [
+                    {"label": sev, "count": by_severity.get(sev, 0)}
+                    for sev in ("Critical", "High", "Medium", "Low")
+                ],
+                "drone_attacks": [{"label": k, "count": v} for k, v in by_drone.most_common()],
+                "recovery_actions": [{"label": k, "count": v} for k, v in rec_stats.most_common()],
+                "network_traffic": {
+                    "Inbound": sum(1 for p in all_pkts if p["direction"] == "Inbound"),
+                    "Outbound": sum(1 for p in all_pkts if p["direction"] == "Outbound"),
+                    "Threats": sum(1 for p in all_pkts if p["threat_type"] is not None),
+                },
+            }
+
+    @router.get("/logs")
+    def unified_logs(
+        q: str = Query("", max_length=100),
+        drone_id: Optional[int] = None,
+        attack_type: Optional[str] = None,
+        category: Optional[str] = None,
+        date_from: Optional[str] = None,
+        date_to: Optional[str] = None,
+    ):
+        with lock, engine.connect() as c:
+            all_drones = {d.id: d for d in c.execute(select(drones)).mappings()}
+            rows = c.execute(select(events).order_by(events.c.id.desc()).limit(300)).mappings().all()
+            needle = q.strip().lower()
+            items = []
+            for r in rows:
+                if drone_id is not None and r["drone"] != drone_id:
+                    continue
+                if attack_type and r["kind"] != attack_type:
+                    continue
+                if category and r["category"] != category:
+                    continue
+                if not _in_date_range(r["time"], date_from, date_to):
+                    continue
+                d_name = all_drones[r["drone"]].name if r["drone"] in all_drones else f"Drone {r['drone']}"
+                if needle and not (
+                    needle in r["kind"].lower()
+                    or needle in r["detail"].lower()
+                    or needle in d_name.lower()
+                    or needle in r["status"].lower()
+                ):
+                    continue
+                items.append({**r, "drone_name": d_name})
+            kinds = sorted({r["kind"] for r in rows})
+            categories = sorted({r["category"] for r in rows})
+            return {"items": items, "kinds": kinds, "categories": categories}
+
+    @router.get("/reports/summary")
+    def report_summary():
+        with lock, engine.connect() as c:
+            return _build_report_summary(c)
+
+    @router.get("/reports/export")
+    def report_export(format: Literal["pdf", "csv"] = "pdf"):
+        with lock, engine.connect() as c:
+            summary = _build_report_summary(c)
+        if format == "csv":
+            csv_data = build_csv_report(summary)
+            return Response(
+                content=csv_data,
+                media_type="text/csv",
+                headers={"Content-Disposition": 'attachment; filename="skysentinel-security-report.csv"'},
+            )
+        pdf_bytes = build_pdf_report(summary)
+        return Response(
+            content=pdf_bytes,
+            media_type="application/pdf",
+            headers={"Content-Disposition": 'attachment; filename="skysentinel-security-report.pdf"'},
+        )
+
+    @router.get("/admin/settings")
+    def get_admin_settings():
+        with lock, engine.connect() as c:
+            return {"thresholds": get_thresholds(c)}
+
+    @router.put("/admin/settings")
+    def update_admin_settings(payload: ThresholdSettings):
+        with lock, engine.begin() as c:
+            vals = payload.model_dump()
+            existing = c.execute(select(system_settings.c.key).where(system_settings.c.key == "thresholds")).scalar()
+            if existing:
+                c.execute(system_settings.update().where(system_settings.c.key == "thresholds").values(value=vals, updated_at=now()))
+            else:
+                c.execute(system_settings.insert().values(key="thresholds", value=vals, updated_at=now()))
+            record_audit(c, "operator", "UPDATE_THRESHOLDS", "system_settings", f"Updated thresholds: {vals}")
+            return {"thresholds": vals}
+
+    @router.get("/admin/audit-logs")
+    def get_audit_logs():
+        with lock, engine.connect() as c:
+            rows = c.execute(select(audit_logs).order_by(audit_logs.c.id.desc()).limit(100)).mappings().all()
+            return {"items": rows}
 
     return router

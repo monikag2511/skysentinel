@@ -1,15 +1,17 @@
 from contextlib import asynccontextmanager
+import os
 from threading import RLock
 from time import monotonic
 from typing import Literal
 from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from sqlalchemy import or_, select
 from sqlalchemy.exc import SQLAlchemyError
 from db import alerts, database, drones, events, network_packets, recoveries, samples
 from model import position, trained
 from routes_platform import build_platform_router
-from service import FlightWatch, create_alert, log, now
+from service import FlightWatch, create_alert, log, now, record_audit
 
 
 class Command(BaseModel):
@@ -36,6 +38,19 @@ def create_app(engine=None, *, docs=True):
         redoc_url="/redoc" if docs else None,
         openapi_url="/openapi.json" if docs else None,
     )
+
+    @app.middleware("http")
+    async def dev_role_guard(request: Request, call_next):
+        if not hasattr(request.state, "role"):
+            cookie_role = request.cookies.get("sky_role")
+            request.state.role = cookie_role if cookie_role in ("viewer", "operator") else "operator"
+        if (
+            request.state.role == "viewer"
+            and request.method in ("POST", "PUT", "DELETE", "PATCH")
+            and not request.url.path.startswith("/api/auth/")
+        ):
+            return JSONResponse({"detail": "Admin or operator login required for this action"}, 403)
+        return await call_next(request)
 
     @app.get("/health/live")
     def live():
@@ -214,6 +229,36 @@ def create_app(engine=None, *, docs=True):
                 )
             )
             return {"ok": True}
+
+    @app.post("/api/auth/login")
+    def auth_login(payload: dict):
+        username = str(payload.get("username", "")).strip().lower()
+        password = str(payload.get("password", ""))
+        op_pw = os.getenv("SKY_OPERATOR_PASSWORD") or "skysentinel-admin"
+        vw_pw = os.getenv("SKY_VIEWER_PASSWORD") or "skysentinel-viewer"
+        if username in ("admin", "operator") and password == op_pw:
+            role = "operator"
+        elif username == "viewer" and password == vw_pw:
+            role = "viewer"
+        else:
+            raise HTTPException(401, "Invalid credentials")
+        with lock, engine.begin() as c:
+            record_audit(c, username, "ADMIN_LOGIN", "Session", f"Signed in with role={role}")
+        resp = JSONResponse({"ok": True, "role": role, "username": username})
+        resp.set_cookie("sky_role", role, httponly=True, samesite="lax")
+        return resp
+
+    @app.post("/api/auth/logout")
+    def auth_logout(request: Request):
+        with lock, engine.begin() as c:
+            record_audit(c, getattr(request.state, "role", "operator"), "ADMIN_LOGOUT", "Session", "Switched session to locked viewer mode")
+        resp = JSONResponse({"ok": True, "role": "viewer"})
+        resp.set_cookie("sky_role", "viewer", httponly=True, samesite="lax")
+        return resp
+
+    @app.get("/api/auth/session")
+    def auth_session(request: Request):
+        return {"role": getattr(request.state, "role", "operator")}
 
     app.include_router(build_platform_router(engine, lock, watch))
     return app

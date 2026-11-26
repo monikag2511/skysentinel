@@ -129,3 +129,48 @@ def test_simulations_recovery_and_alerts(tmp_path):
             r = client.post("/api/drones/0/recover", json={"action": act})
             assert r.is_success, f"{act}: {r.text}"
             assert r.json()["status"] == "Successful"
+
+
+def test_analytics_logs_reports_and_admin_auth(tmp_path, monkeypatch):
+    monkeypatch.setenv("SKY_OPERATOR_PASSWORD", "skysentinel-admin")
+    engine = create_engine(f"sqlite:///{tmp_path / 'admin.db'}")
+    metadata.create_all(engine)
+    with TestClient(create_app(engine)) as client:
+        client.post("/api/simulations/run", json={"drone_id": 0, "attack_type": "gps_spoofing"})
+        an = client.get("/api/analytics").json()
+        assert an["gps_vs_normal"]["GPS Spoofed"] >= 1
+        assert len(an["attack_distribution"]) >= 1
+
+        logs = client.get("/api/logs").json()
+        assert len(logs["items"]) >= 3
+
+        summary = client.get("/api/reports/summary").json()
+        assert summary["overview"]["total_drones"] == 3
+        pdf = client.get("/api/reports/export", params={"format": "pdf"})
+        assert pdf.is_success and pdf.content.startswith(b"%PDF-1.4") and b"%%EOF" in pdf.content
+        csv_resp = client.get("/api/reports/export", params={"format": "csv"})
+        assert csv_resp.is_success and "SECTION 1: DRONE ACTIVITY SUMMARY" in csv_resp.text
+
+        # Logout locks mutations; login unlocks them
+        assert client.post("/api/auth/logout").is_success
+        assert client.put("/api/admin/settings", json={
+            "deviation_threshold_m": 200.0,
+            "spoof_score_threshold": 0.6,
+            "speed_threshold_kmh": 50.0,
+            "accel_threshold_ms2": 4.0,
+            "rate_limit_per_sec": 10,
+            "low_battery_pct": 20.0,
+        }).status_code == 403
+
+        assert client.post("/api/auth/login", json={"username": "admin", "password": "wrong"}).status_code == 401
+        assert client.post("/api/auth/login", json={"username": "admin", "password": "skysentinel-admin"}).is_success
+        upd = client.put("/api/admin/settings", json={
+            "deviation_threshold_m": 200.0,
+            "spoof_score_threshold": 0.6,
+            "speed_threshold_kmh": 50.0,
+            "accel_threshold_ms2": 4.0,
+            "rate_limit_per_sec": 10,
+            "low_battery_pct": 20.0,
+        })
+        assert upd.is_success and upd.json()["thresholds"]["deviation_threshold_m"] == 200.0
+        assert len(client.get("/api/admin/audit-logs").json()["items"]) >= 2
