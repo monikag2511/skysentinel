@@ -29,7 +29,7 @@ node --env-file=../backend/.env node_modules/@playwright/test/cli.js test
 
 For rollback, retain the previous image digest. This release adds no database migrations. Redeploy the previous image if the readiness probe or recovery smoke test fails. For future schema changes, verify backward compatibility before rolling the application back.
 
-A daylight flight-watch console for a three-drone cybersecurity simulation. React and Leaflet render the trajectories. FastAPI authenticates simulator readings and evaluates GPS anomalies. Neon PostgreSQL stores the fleet, telemetry, incidents and recovery history.
+A dark-theme drone cybersecurity command platform built with React, TypeScript, Leaflet, FastAPI, scikit-learn, and PostgreSQL (Neon). Modules include the Security Dashboard, Drone Management (CRUD), Live Multi-Drone GPS Tracking, Intelligent GPS Spoofing & ML Analysis, Flight Path Deviation Detection, Secure AES-256-GCM Communication & Network Traffic Monitoring, Attack Simulation Centre, Autonomous Recovery, Real-Time Security Alert Centre, Multi-Drone & Health Monitoring, Security Analytics, Security Logs, PDF/CSV Report Generation, and Admin Management.
 
 ## Start on Windows
 From the repository root, create the virtual environment and install the backend once.
