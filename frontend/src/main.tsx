@@ -4,6 +4,9 @@ import { Chart } from "./Chart";
 import { Archive } from "./Archive";
 import { DashboardOverview } from "./pages/DashboardPage";
 import { FleetHealthPage } from "./pages/FleetHealthPage";
+import { DroneManagementPage } from "./pages/DroneManagementPage";
+import { LiveTrackingPage } from "./pages/LiveTrackingPage";
+import { DeviationsPage } from "./pages/DeviationsPage";
 import type { DashboardData, Drone, NavSection, Reading, Snapshot } from "./types";
 import "./style.css";
 
@@ -256,7 +259,32 @@ function App() {
                 requestApi={request}
                 onSelectDrone={(droneId) => {
                   select(droneId);
-                  setSection("dashboard");
+                  setSection("tracking");
+                }}
+              />
+            ) : section === "drones" ? (
+              <DroneManagementPage
+                role={snapshot.role}
+                requestApi={request}
+                onChanged={refresh}
+                onSelectMap={(droneId) => {
+                  select(droneId);
+                  setSection("tracking");
+                }}
+              />
+            ) : section === "tracking" ? (
+              <LiveTrackingPage
+                fleet={snapshot.fleet}
+                selected={d}
+                onSelect={(droneId) => select(droneId)}
+              />
+            ) : section === "deviations" ? (
+              <DeviationsPage
+                fleet={snapshot.fleet}
+                requestApi={request}
+                onFocusMap={(droneId) => {
+                  select(droneId);
+                  setSection("tracking");
                 }}
               />
             ) : (

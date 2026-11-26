@@ -23,7 +23,7 @@ export function Chart({
     const m = L.map(host.current!, {
       attributionControl: false,
       scrollWheelZoom: false,
-      minZoom: 12,
+      minZoom: 11,
       zoomSnap: 0.25,
       maxZoom: 19,
     });
@@ -40,12 +40,15 @@ export function Chart({
   }, []);
 
   useEffect(() => {
-    if (selected.route.length > 0) {
-      map.current!.fitBounds(L.latLngBounds(selected.route).pad(0.45), {
+    const targetPoints = showAllDrones
+      ? fleet.flatMap((d) => d.route)
+      : selected.route;
+    if (targetPoints.length > 0) {
+      map.current!.fitBounds(L.latLngBounds(targetPoints).pad(0.35), {
         animate: false,
       });
     }
-  }, [selected.id]);
+  }, [selected.id, showAllDrones, fleet.length]);
 
   useEffect(() => {
     const g = layer.current!;
@@ -70,17 +73,23 @@ export function Chart({
           d.mode === "Attitude hold" ||
           d.track.at(-1)?.classification === "GPS Spoofed";
         L.polyline(reported, {
-          color: d.id === selected.id ? "#f97316" : "#64748b",
+          color: d.id === selected.id ? "#f97316" : "#38bdf8",
           weight: d.id === selected.id ? 3 : 2,
         }).addTo(g);
 
         d.track.forEach((s) => {
           if (s.classification === "GPS Spoofed" || (s.deviation_m ?? 0) > 150) {
+            // Highlight affected deviation segment between expected and reported position
+            L.polyline(
+              [s.expected, [s.reading.latitude, s.reading.longitude]],
+              { color: "#ef4444", weight: 2, dashArray: "3 4" },
+            ).addTo(g);
+
             L.circleMarker([s.reading.latitude, s.reading.longitude], {
               radius: 6,
               color: "#ef4444",
               fillColor: "#ef4444",
-              fillOpacity: 0.75,
+              fillOpacity: 0.85,
             })
               .bindTooltip(
                 `${d.name} · Suspicious fix (${Math.round(s.deviation_m ?? 0)}m)`,
@@ -90,14 +99,15 @@ export function Chart({
         });
 
         const latest = reported[reported.length - 1];
+        const latestReading = d.track.at(-1)!.reading;
         const marker = L.circleMarker(latest, {
-          radius: d.id === selected.id ? 6 : 5,
+          radius: d.id === selected.id ? 7 : 6,
           color: isSpoofed ? "#ef4444" : "#f97316",
           fillColor: isSpoofed ? "#ef4444" : "#f97316",
           fillOpacity: 1,
         })
           .bindTooltip(
-            `${d.id === selected.id ? "Reported GPS" : d.name} · ${latest[0].toFixed(4)}, ${latest[1].toFixed(4)}`,
+            `${d.id === selected.id ? "Reported GPS" : d.name} · ${latest[0].toFixed(4)}, ${latest[1].toFixed(4)} (${latestReading.speed.toFixed(1)} km/h)`,
           )
           .addTo(g);
         if (onSelectDrone) {
