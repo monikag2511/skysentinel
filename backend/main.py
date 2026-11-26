@@ -8,6 +8,7 @@ from sqlalchemy import or_, select
 from sqlalchemy.exc import SQLAlchemyError
 from db import alerts, database, drones, events, recoveries, samples
 from model import position, trained
+from routes_platform import build_platform_router
 from service import FlightWatch, create_alert, log, now
 
 
@@ -197,4 +198,5 @@ def create_app(engine=None, *, docs=True):
                         break
             return {"ok": True}
 
+    app.include_router(build_platform_router(engine, lock, watch))
     return app

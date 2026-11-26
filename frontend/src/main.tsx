@@ -2,7 +2,9 @@ import { useEffect, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { Chart } from "./Chart";
 import { Archive } from "./Archive";
-import type { Drone, NavSection, Reading, Snapshot } from "./types";
+import { DashboardOverview } from "./pages/DashboardPage";
+import { FleetHealthPage } from "./pages/FleetHealthPage";
+import type { DashboardData, Drone, NavSection, Reading, Snapshot } from "./types";
 import "./style.css";
 
 const instruments: [keyof Reading, string, string][] = [
@@ -56,6 +58,7 @@ function App() {
   const [section, setSection] = useState<NavSection>("dashboard");
   const [navOpen, setNavOpen] = useState(false);
   const [snapshot, setSnapshot] = useState<Snapshot>();
+  const [dashboard, setDashboard] = useState<DashboardData | null>(null);
   const [id, select] = useState(0);
   const [scenario, choose] = useState("normal");
   const [error, fail] = useState("");
@@ -76,9 +79,13 @@ function App() {
 
   async function refresh() {
     const ticket = ++version.current;
-    const data = await request("watch");
+    const [watchData, dashData] = await Promise.all([
+      request("watch"),
+      request("dashboard").catch(() => null),
+    ]);
     if (ticket === version.current) {
-      setSnapshot(data);
+      setSnapshot(watchData);
+      if (dashData) setDashboard(dashData);
       fail("");
     }
   }
@@ -129,7 +136,9 @@ function App() {
     ) || [];
 
   const activeAlertsCount =
-    snapshot?.history.filter((e) => e.status === "Open").length ?? 0;
+    dashboard?.stats.active_alerts ??
+    snapshot?.history.filter((e) => e.status === "Open").length ??
+    0;
 
   return (
     <div className="app-shell">
@@ -182,6 +191,34 @@ function App() {
             </span>
           </div>
           <div className="topbar-right">
+            {dashboard && (
+              <>
+                <span
+                  className={
+                    "pill " +
+                    (dashboard.stats.gps_security_status === "Under Attack"
+                      ? "danger"
+                      : dashboard.stats.gps_security_status === "Alert"
+                        ? "warn"
+                        : "")
+                  }
+                >
+                  GPS: {dashboard.stats.gps_security_status}
+                </span>
+                <span
+                  className={
+                    "pill " +
+                    (dashboard.stats.network_security_status === "Compromised"
+                      ? "danger"
+                      : dashboard.stats.network_security_status === "Warning"
+                        ? "warn"
+                        : "")
+                  }
+                >
+                  NET: {dashboard.stats.network_security_status}
+                </span>
+              </>
+            )}
             <span className="session">Simulation</span>
           </div>
         </header>
@@ -213,184 +250,201 @@ function App() {
           )}
 
           {snapshot && d ? (
-            <>
-              <div className="fleet" aria-label="Select aircraft">
-                {snapshot.fleet.map((a) => (
-                  <button
-                    aria-pressed={a.id === d.id}
-                    key={a.id}
-                    onClick={() => {
-                      select(a.id);
-                      play(false);
-                      tell("");
-                    }}
-                  >
-                    <small>{a.code ?? `DRN / 00${a.id + 1}`}</small>
-                    <strong>{a.name}</strong>
-                    <span>{a.mode}</span>
-                  </button>
-                ))}
-              </div>
-              <div className="workspace">
-                <section className="plot">
-                  <div className="sectionHead">
-                    <div>
-                      <small>TRAJECTORY</small>
-                      <h2>Flight chart</h2>
-                    </div>
-                    <span className="stamp">13° N · 80° E</span>
-                  </div>
-                  <Chart selected={d} fleet={snapshot.fleet} />
-                  <div className="legend">
-                    <span>┄ Expected route</span>
-                    <span>━ Reported GPS</span>
-                    <span>✈ Trusted fix</span>
-                  </div>
-                </section>
-                <aside>
-                  <small>FLIGHT STRIP &nbsp; / &nbsp; 00{d.id + 1}</small>
-                  <h2>{d.name}</h2>
-                  <dl>
-                    {instruments.map(([key, label, unit]) => (
-                      <div key={key}>
-                        <dt>{label}</dt>
-                        <dd>
-                          {d.track.at(-1)
-                            ? d.track
-                                .at(-1)!
-                                .reading[key].toFixed(
-                                  key === "latitude" || key === "longitude"
-                                    ? 4
-                                    : 1,
-                                )
-                            : "0.0"}{" "}
-                          <em>{unit}</em>
-                        </dd>
-                      </div>
-                    ))}
-                  </dl>
-                  {snapshot.role === "viewer" && (
-                    <p>Viewer access · flight controls locked</p>
-                  )}
-                  <fieldset
-                    className="controls"
-                    disabled={snapshot.role === "viewer"}
-                  >
-                    <label htmlFor="scenario">Demo scenario</label>
-                    <select
-                      id="scenario"
-                      value={scenario}
-                      onChange={(e) => choose(e.target.value)}
-                    >
-                      {scenarios.map(([key, label]) => (
-                        <option key={key} value={key}>
-                          {label}
-                        </option>
-                      ))}
-                    </select>
+            section === "health" ? (
+              <FleetHealthPage
+                dashboard={dashboard}
+                requestApi={request}
+                onSelectDrone={(droneId) => {
+                  select(droneId);
+                  setSection("dashboard");
+                }}
+              />
+            ) : (
+              <>
+                {section === "dashboard" && (
+                  <DashboardOverview
+                    dashboard={dashboard}
+                    onNavigate={(s) => setSection(s)}
+                  />
+                )}
+                <div className="fleet" aria-label="Select aircraft">
+                  {snapshot.fleet.map((a) => (
                     <button
-                      className="primary"
-                      disabled={busy || d.mode !== "Patrol"}
+                      aria-pressed={a.id === d.id}
+                      key={a.id}
                       onClick={() => {
+                        select(a.id);
                         play(false);
-                        void run(scenario);
+                        tell("");
                       }}
                     >
-                      Run scenario
+                      <small>{a.code ?? `DRN / 00${a.id + 1}`}</small>
+                      <strong>{a.name}</strong>
+                      <span>{a.mode}</span>
                     </button>
-                    {d.mode === "Patrol" ? (
-                      <button disabled={busy} onClick={() => play(!live)}>
-                        {live ? "Pause patrol" : "Start continuous patrol"}
-                      </button>
-                    ) : (
+                  ))}
+                </div>
+                <div className="workspace">
+                  <section className="plot">
+                    <div className="sectionHead">
+                      <div>
+                        <small>TRAJECTORY</small>
+                        <h2>Flight chart</h2>
+                      </div>
+                      <span className="stamp">13° N · 80° E</span>
+                    </div>
+                    <Chart selected={d} fleet={snapshot.fleet} />
+                    <div className="legend">
+                      <span>┄ Expected route</span>
+                      <span>━ Reported GPS</span>
+                      <span>✈ Trusted fix</span>
+                    </div>
+                  </section>
+                  <aside>
+                    <small>FLIGHT STRIP &nbsp; / &nbsp; 00{d.id + 1}</small>
+                    <h2>{d.name}</h2>
+                    <dl>
+                      {instruments.map(([key, label, unit]) => (
+                        <div key={key}>
+                          <dt>{label}</dt>
+                          <dd>
+                            {d.track.at(-1)
+                              ? d.track
+                                  .at(-1)!
+                                  .reading[key].toFixed(
+                                    key === "latitude" || key === "longitude"
+                                      ? 4
+                                      : 1,
+                                  )
+                              : "0.0"}{" "}
+                            <em>{unit}</em>
+                          </dd>
+                        </div>
+                      ))}
+                    </dl>
+                    {snapshot.role === "viewer" && (
+                      <p>Viewer access · flight controls locked</p>
+                    )}
+                    <fieldset
+                      className="controls"
+                      disabled={snapshot.role === "viewer"}
+                    >
+                      <label htmlFor="scenario">Demo scenario</label>
+                      <select
+                        id="scenario"
+                        value={scenario}
+                        onChange={(e) => choose(e.target.value)}
+                      >
+                        {scenarios.map(([key, label]) => (
+                          <option key={key} value={key}>
+                            {label}
+                          </option>
+                        ))}
+                      </select>
                       <button
-                        disabled={busy}
+                        className="primary"
+                        disabled={busy || d.mode !== "Patrol"}
                         onClick={() => {
                           play(false);
-                          void run(d.mode === "At base" ? "resume" : "home");
+                          void run(scenario);
                         }}
                       >
-                        {d.mode === "At base"
-                          ? "Resume patrol"
-                          : "Return to base"}
+                        Run scenario
                       </button>
-                    )}
-                    <div className="notice" role="status">
-                      {busy ? "Updating flight record…" : notice || d.mode}
-                    </div>
-                  </fieldset>
-                </aside>
-              </div>
-              <section id="ledger">
-                <div className="sectionHead">
-                  <div>
-                    <small>SECURITY HISTORY</small>
-                    <h2>Incident ledger</h2>
-                  </div>
-                  <select
-                    aria-label="Filter ledger"
-                    value={filter}
-                    onChange={(e) => setFilter(e.target.value)}
-                  >
-                    <option>All aircraft</option>
-                    <option>Selected aircraft</option>
-                  </select>
-                </div>
-                <ol>
-                  {events.map((e) => (
-                    <li key={e.id}>
-                      <time>{clock(e.time)} UTC</time>
-                      <div>
-                        <strong>{e.kind}</strong>
-                        <p>
-                          {snapshot.fleet.find((a) => a.id === e.drone)?.name} ·{" "}
-                          {e.detail}{" "}
-                          {e.score !== null &&
-                            "Model score " + Math.round(e.score * 100) + "%"}
-                        </p>
-                      </div>
-                      <span className={"severity " + e.severity}>
-                        {e.severity}
-                      </span>
-                      {e.status === "Open" && snapshot.role !== "viewer" ? (
-                        <button
-                          disabled={busy}
-                          onClick={() => run("ack", e.id, e.drone)}
-                        >
-                          Acknowledge
+                      {d.mode === "Patrol" ? (
+                        <button disabled={busy} onClick={() => play(!live)}>
+                          {live ? "Pause patrol" : "Start continuous patrol"}
                         </button>
                       ) : (
-                        <span>{e.status}</span>
+                        <button
+                          disabled={busy}
+                          onClick={() => {
+                            play(false);
+                            void run(d.mode === "At base" ? "resume" : "home");
+                          }}
+                        >
+                          {d.mode === "At base"
+                            ? "Resume patrol"
+                            : "Return to base"}
+                        </button>
                       )}
-                    </li>
-                  ))}
-                </ol>
-                <Archive />
-              </section>
-              <section className="evaluation">
-                <h2>Detector evaluation</h2>
-                <button
-                  onClick={async () => {
-                    try {
-                      report(evaluation ? null : await request("evaluation"));
-                    } catch (e) {
-                      fail((e as Error).message);
-                    }
-                  }}
-                >
-                  {evaluation ? "Hide results" : "View test results"}
-                </button>
-                {evaluation && (
-                  <p>
-                    {evaluation.train} training samples · {evaluation.test}{" "}
-                    held-out samples · Precision{" "}
-                    {(evaluation.metrics["1"].precision * 100).toFixed(1)}% ·
-                    Recall {(evaluation.metrics["1"].recall * 100).toFixed(1)}%
-                    · F1 {evaluation.metrics["1"]["f1-score"].toFixed(3)}
-                  </p>
-                )}
-              </section>
-            </>
+                      <div className="notice" role="status">
+                        {busy ? "Updating flight record…" : notice || d.mode}
+                      </div>
+                    </fieldset>
+                  </aside>
+                </div>
+                <section id="ledger">
+                  <div className="sectionHead">
+                    <div>
+                      <small>SECURITY HISTORY</small>
+                      <h2>Incident ledger</h2>
+                    </div>
+                    <select
+                      aria-label="Filter ledger"
+                      value={filter}
+                      onChange={(e) => setFilter(e.target.value)}
+                    >
+                      <option>All aircraft</option>
+                      <option>Selected aircraft</option>
+                    </select>
+                  </div>
+                  <ol>
+                    {events.map((e) => (
+                      <li key={e.id}>
+                        <time>{clock(e.time)} UTC</time>
+                        <div>
+                          <strong>{e.kind}</strong>
+                          <p>
+                            {snapshot.fleet.find((a) => a.id === e.drone)?.name}{" "}
+                            · {e.detail}{" "}
+                            {e.score !== null &&
+                              "Model score " + Math.round(e.score * 100) + "%"}
+                          </p>
+                        </div>
+                        <span className={"severity " + e.severity}>
+                          {e.severity}
+                        </span>
+                        {e.status === "Open" && snapshot.role !== "viewer" ? (
+                          <button
+                            disabled={busy}
+                            onClick={() => run("ack", e.id, e.drone)}
+                          >
+                            Acknowledge
+                          </button>
+                        ) : (
+                          <span>{e.status}</span>
+                        )}
+                      </li>
+                    ))}
+                  </ol>
+                  <Archive />
+                </section>
+                <section className="evaluation">
+                  <h2>Detector evaluation</h2>
+                  <button
+                    onClick={async () => {
+                      try {
+                        report(evaluation ? null : await request("evaluation"));
+                      } catch (e) {
+                        fail((e as Error).message);
+                      }
+                    }}
+                  >
+                    {evaluation ? "Hide results" : "View test results"}
+                  </button>
+                  {evaluation && (
+                    <p>
+                      {evaluation.train} training samples · {evaluation.test}{" "}
+                      held-out samples · Precision{" "}
+                      {(evaluation.metrics["1"].precision * 100).toFixed(1)}% ·
+                      Recall {(evaluation.metrics["1"].recall * 100).toFixed(1)}%
+                      · F1 {evaluation.metrics["1"]["f1-score"].toFixed(3)}
+                    </p>
+                  )}
+                </section>
+              </>
+            )
           ) : (
             !error && <p role="status">Connecting to flight control…</p>
           )}
